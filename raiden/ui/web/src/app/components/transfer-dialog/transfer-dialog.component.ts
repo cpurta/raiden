@@ -1,7 +1,7 @@
+import { Observable, Subscription } from 'rxjs';
+import { share, map } from 'rxjs/operators';
 import { Component, OnInit, OnDestroy, Input, Output, EventEmitter } from '@angular/core';
 import { FormControl, FormGroup, FormBuilder, Validators } from '@angular/forms';
-import { Observable } from 'rxjs/Observable';
-import { Subscription } from 'rxjs/Subscription';
 import { SelectItem } from 'primeng/primeng';
 
 import { RaidenService } from '../../services/raiden.service';
@@ -41,9 +41,10 @@ export class TransferDialogComponent implements OnInit, OnDestroy {
             amount: [null, (control) => control.value > 0 ? undefined : {invalidAmount: true}]
         });
 
-        this.tokenAddressMapping$ = this.raidenService.getTokens()
-            .map((userTokens) => this.tokenPipe.tokensToSelectItems(userTokens))
-            .share();
+        this.tokenAddressMapping$ = this.raidenService.getTokens().pipe(
+            map((userTokens) => this.tokenPipe.tokensToSelectItems(userTokens)),
+            share(),
+        );
     }
 
     ngOnDestroy() {
@@ -68,23 +69,23 @@ export class TransferDialogComponent implements OnInit, OnDestroy {
         this.raidenService.initiateTransfer(
             value['token_address'],
             value['target_address'],
-            value['amount'])
-            .subscribe((response) => {
-                if ('target_address' in response && 'identifier' in response) {
-                    this.sharedService.msg({
-                        severity: 'success',
-                        summary: 'Transfer successful',
-                        detail: `${value.amount} of {value.token_address} tokens
-                            where transfered to ${value.target_address}`,
-                    });
-                } else {
-                    this.sharedService.msg({
-                        severity: 'error',
-                        summary: 'Transfer error',
-                        detail: JSON.stringify(response),
-                    });
-                }
-            });
+            value['amount'],
+        ).subscribe((response) => {
+            if ('target_address' in response && 'identifier' in response) {
+                this.sharedService.msg({
+                    severity: 'success',
+                    summary: 'Transfer successful',
+                    detail: `${value.amount} of {value.token_address} tokens
+                        where transfered to ${value.target_address}`,
+                });
+            } else {
+                this.sharedService.msg({
+                    severity: 'error',
+                    summary: 'Transfer error',
+                    detail: JSON.stringify(response),
+                });
+            }
+        });
         this.visible = false;
     }
 

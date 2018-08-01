@@ -1,5 +1,4 @@
-import binascii
-from binascii import unhexlify
+from binascii import Error as DecodeError
 
 from marshmallow import (
     fields,
@@ -10,18 +9,22 @@ from marshmallow import (
     SchemaOpts,
 )
 from webargs import validate
+from werkzeug.exceptions import NotFound
 from werkzeug.routing import (
     BaseConverter,
     ValidationError,
 )
-from eth_utils import is_checksum_address, to_checksum_address
-
+from eth_utils import (
+    is_checksum_address,
+    to_checksum_address,
+    to_canonical_address,
+    decode_hex,
+    encode_hex,
+)
 
 from raiden.api.objects import (
     Address,
     AddressList,
-    Channel,
-    ChannelList,
     PartnersPerToken,
     PartnersPerTokenList,
 )
@@ -40,26 +43,54 @@ from raiden.transfer.state import (
 from raiden.utils import data_encoder, data_decoder
 
 
+class InvalidEndpoint(NotFound):
+    """
+    Exception to be raised instead of ValidationError if we want to skip the remaining
+    endpoint matching rules and give a reason why the endpoint is invalid.
+    """
+
+
 class HexAddressConverter(BaseConverter):
     def to_python(self, value):
         if value[:2] != '0x':
-            raise ValidationError()
+            raise InvalidEndpoint('Not a valid hex address, 0x prefix missing.')
 
         if not is_checksum_address(value):
-            raise ValidationError()
+            raise InvalidEndpoint('Not a valid EIP55 encoded address.')
 
         try:
-            value = unhexlify(value[2:])
-        except TypeError:
-            raise ValidationError()
-
-        if len(value) != 20:
-            raise ValidationError()
+            value = to_canonical_address(value)
+        except ValueError:
+            raise InvalidEndpoint('Could not decode hex.')
 
         return value
 
     def to_url(self, value):
         return to_checksum_address(value)
+
+
+# do this to make testing easier
+def decode_keccak(value: str) -> bytes:
+    if value[:2] != '0x':
+        raise ValidationError("Channel Id is missing the '0x' prefix")
+
+    try:
+        value = decode_hex(value)
+    except DecodeError:
+        raise ValidationError('Channel Id is not a valid hexadecimal value')
+
+    if len(value) != 32:
+        raise ValidationError('Channel Id is not valid')
+
+    return value
+
+
+class KeccakConverter(BaseConverter):
+    def to_python(self, value: str):
+        return decode_keccak(value)
+
+    def to_url(self, value):
+        return encode_hex(value)
 
 
 class AddressField(fields.Field):
@@ -81,8 +112,33 @@ class AddressField(fields.Field):
             self.fail('invalid_checksum')
 
         try:
-            value = unhexlify(value[2:])
-        except binascii.Error:
+            value = to_canonical_address(value)
+        except ValueError:
+            self.fail('invalid_data')
+
+        if len(value) != 20:
+            self.fail('invalid_size')
+
+        return value
+
+
+class KeccakField(fields.Field):
+    default_error_messages = {
+        'missing_prefix': 'Not a valid hex encoded, must be 0x prefixed.',
+        'invalid_data': 'Not a valid hex encoded hash, contains invalid characters.',
+        'invalid_size': 'Not a valid hex encoded hash, decoded has is not 20 bytes long.',
+    }
+
+    def _serialize(self, value, attr, obj):
+        return encode_hex(value)
+
+    def _deserialize(self, value, attr, data):
+        if value[:2] != '0x':
+            self.fail('missing_prefix')
+
+        try:
+            value = decode_hex(value)
+        except DecodeError:
             self.fail('invalid_data')
 
         if len(value) != 20:
@@ -185,26 +241,9 @@ class PartnersPerTokenListSchema(BaseListSchema):
         decoding_class = PartnersPerTokenList
 
 
-class ChannelSchema(BaseSchema):
-    channel_address = AddressField()
-    token_address = AddressField()
-    partner_address = AddressField()
-    settle_timeout = fields.Integer()
-    reveal_timeout = fields.Integer()
-    balance = fields.Integer()
-    state = fields.String(validate=validate.OneOf([
-        CHANNEL_STATE_CLOSED,
-        CHANNEL_STATE_OPENED,
-        CHANNEL_STATE_SETTLED,
-    ]))
-
-    class Meta:
-        strict = True
-        decoding_class = Channel
-
-
 class ChannelStateSchema(BaseSchema):
-    channel_address = AddressField(attribute='identifier')
+    channel_identifier = KeccakField(attribute='identifier')
+    token_network_identifier = AddressField()
     token_address = AddressField()
     partner_address = fields.Method('get_partner_address')
     settle_timeout = fields.Integer()
@@ -226,25 +265,15 @@ class ChannelStateSchema(BaseSchema):
 
     class Meta:
         strict = True
-        decoding_class = Channel
+        decoding_class = dict
 
 
-class ChannelRequestSchema(BaseSchema):
-    channel_address = AddressField(missing=None)
+class ChannelPutSchema(BaseSchema):
     token_address = AddressField(required=True)
     partner_address = AddressField(required=True)
     settle_timeout = fields.Integer(missing=DEFAULT_SETTLE_TIMEOUT)
     reveal_timeout = fields.Integer(missing=DEFAULT_REVEAL_TIMEOUT)
     balance = fields.Integer(default=None, missing=None)
-    state = fields.String(
-        default=None,
-        missing=None,
-        validate=validate.OneOf([
-            CHANNEL_STATE_CLOSED,
-            CHANNEL_STATE_OPENED,
-            CHANNEL_STATE_SETTLED,
-        ]),
-    )
 
     class Meta:
         strict = True
@@ -268,14 +297,6 @@ class ChannelPatchSchema(BaseSchema):
         strict = True
         # decoding to a dict is required by the @use_kwargs decorator from webargs:
         decoding_class = dict
-
-
-class ChannelListSchema(BaseListSchema):
-    data = fields.Nested(ChannelStateSchema, many=True)
-
-    class Meta:
-        strict = True
-        decoding_class = ChannelList
 
 
 class TransferSchema(BaseSchema):
@@ -303,12 +324,6 @@ class ConnectionsConnectSchema(BaseSchema):
 
 
 class ConnectionsLeaveSchema(BaseSchema):
-    only_receiving_channels = fields.Boolean(
-        required=False,
-        default=True,
-        missing=True,
-    )
-
     class Meta:
         strict = True
         decoding_class = dict

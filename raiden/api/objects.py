@@ -13,10 +13,6 @@ class FlatList(list):
         return '<{}: {}>'.format(self.__class__.__name__, list(self))
 
 
-class ChannelList(FlatList):
-    pass
-
-
 class AddressList(FlatList):
     pass
 
@@ -34,23 +30,3 @@ class PartnersPerToken:
     def __init__(self, partner_address, channel):
         self.partner_address = partner_address
         self.channel = channel
-
-
-class Channel:
-    def __init__(
-            self,
-            channel_address,
-            token_address,
-            partner_address,
-            settle_timeout,
-            reveal_timeout,
-            balance,
-            state,
-    ):
-        self.channel_address = channel_address
-        self.token_address = token_address
-        self.partner_address = partner_address
-        self.settle_timeout = settle_timeout
-        self.reveal_timeout = reveal_timeout
-        self.balance = balance
-        self.state = state

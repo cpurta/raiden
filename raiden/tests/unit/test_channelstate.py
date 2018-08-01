@@ -29,7 +29,6 @@ from raiden.transfer.merkle_tree import (
     merkle_leaves_from_packed_data,
 )
 from raiden.transfer.state import (
-    CHANNEL_STATE_OPENED,
     EMPTY_MERKLE_ROOT,
     balanceproof_from_envelope,
     MerkleTreeState,
@@ -44,13 +43,18 @@ from raiden.transfer.state_change import (
     Block,
     ContractReceiveChannelClosed,
     ContractReceiveChannelNewBalance,
-    ContractReceiveChannelUnlock,
+    ContractReceiveChannelSettled,
     ReceiveTransferDirect,
     ReceiveUnlock,
 )
 from raiden.tests.utils import factories
 from raiden.tests.utils.factories import (
+    UNIT_CHAIN_ID,
     UNIT_REGISTRY_IDENTIFIER,
+    UNIT_TRANSFER_INITIATOR,
+    UNIT_TRANSFER_SENDER,
+    UNIT_TRANSFER_TARGET,
+    UNIT_SECRET,
     HOP1,
     make_secret,
 )
@@ -115,7 +119,7 @@ def create_channel_from_models(our_model, partner_model):
         partner_model.balance,
     )
 
-    identifier = factories.make_address()
+    identifier = factories.make_channel_identifier()
     token_address = factories.make_address()
     token_network_identifier = factories.make_address()
     reveal_timeout = 10
@@ -127,19 +131,19 @@ def create_channel_from_models(our_model, partner_model):
     )
     closed_transaction = None
     settled_transaction = None
-    channel_state = CHANNEL_STATE_OPENED
 
     channel_state = NettingChannelState(
-        identifier,
-        token_address,
-        token_network_identifier,
-        reveal_timeout,
-        settle_timeout,
-        our_state,
-        partner_state,
-        opened_transaction,
-        closed_transaction,
-        settled_transaction,
+        identifier=identifier,
+        chain_id=UNIT_CHAIN_ID,
+        token_address=token_address,
+        token_network_identifier=token_network_identifier,
+        reveal_timeout=reveal_timeout,
+        settle_timeout=settle_timeout,
+        our_state=our_state,
+        partner_state=partner_state,
+        open_transaction=opened_transaction,
+        close_transaction=closed_transaction,
+        settle_transaction=settled_transaction,
     )
 
     assert_partner_state(
@@ -165,6 +169,7 @@ def make_receive_transfer_direct(
         locksroot=EMPTY_MERKLE_ROOT,
         token_network_identifier=UNIT_REGISTRY_IDENTIFIER,
         locked_amount=None,
+        chain_id=UNIT_CHAIN_ID,
 ):
 
     address = privatekey_to_address(privkey.secret)
@@ -177,16 +182,17 @@ def make_receive_transfer_direct(
     message_identifier = random.randint(0, UINT64_MAX)
     payment_identifier = nonce
     mediated_transfer_msg = DirectTransfer(
-        message_identifier,
-        payment_identifier,
-        nonce,
-        channel_state.token_network_identifier,
-        channel_state.token_address,
-        channel_state.identifier,
-        transferred_amount,
-        locked_amount,
-        channel_state.partner_state.address,
-        locksroot,
+        chain_id=chain_id,
+        message_identifier=message_identifier,
+        payment_identifier=payment_identifier,
+        nonce=nonce,
+        token_network_address=channel_state.token_network_identifier,
+        token=channel_state.token_address,
+        channel_identifier=channel_state.identifier,
+        transferred_amount=transferred_amount,
+        locked_amount=locked_amount,
+        recipient=channel_state.partner_state.address,
+        locksroot=locksroot,
     )
     mediated_transfer_msg.sign(privkey)
 
@@ -211,6 +217,7 @@ def make_receive_transfer_mediated(
         merkletree_leaves=None,
         token_network_address=UNIT_REGISTRY_IDENTIFIER,
         locked_amount=None,
+        chain_id=UNIT_CHAIN_ID,
 ):
 
     if not isinstance(lock, HashTimeLockState):
@@ -237,19 +244,20 @@ def make_receive_transfer_mediated(
     transfer_target = factories.make_address()
     transfer_initiator = factories.make_address()
     mediated_transfer_msg = LockedTransfer(
-        random.randint(0, UINT64_MAX),
-        payment_identifier,
-        nonce,
-        token_network_address,
-        channel_state.token_address,
-        channel_state.identifier,
-        transferred_amount,
-        locked_amount,
-        channel_state.partner_state.address,
-        locksroot,
-        lock,
-        transfer_target,
-        transfer_initiator,
+        chain_id=chain_id,
+        message_identifier=random.randint(0, UINT64_MAX),
+        payment_identifier=payment_identifier,
+        nonce=nonce,
+        token_network_address=token_network_address,
+        token=channel_state.token_address,
+        channel_identifier=channel_state.identifier,
+        transferred_amount=transferred_amount,
+        locked_amount=locked_amount,
+        recipient=channel_state.partner_state.address,
+        locksroot=locksroot,
+        lock=lock,
+        target=transfer_target,
+        initiator=transfer_initiator,
     )
     mediated_transfer_msg.sign(privkey)
 
@@ -281,7 +289,6 @@ def test_new_end_state():
     assert channel.is_lock_locked(end_state, lock_secrethash) is False
     assert channel.get_next_nonce(end_state) == 1
     assert channel.get_amount_locked(end_state) == 0
-    assert not channel.get_known_unlocks(end_state)
     assert merkleroot(end_state.merkletree) == EMPTY_MERKLE_ROOT
 
     assert not end_state.secrethashes_to_lockedlocks
@@ -651,23 +658,51 @@ def test_channelstate_receive_lockedtransfer():
     message_identifier = random.randint(0, UINT64_MAX)
     token_network_identifier = channel_state.token_network_identifier
     secret_message = Secret(
+        chain_id=UNIT_CHAIN_ID,
         message_identifier=message_identifier,
         payment_identifier=1,
         nonce=2,
         token_network_address=token_network_identifier,
-        channel=channel_state.identifier,
+        channel_identifier=channel_state.identifier,
         transferred_amount=transferred_amount + lock_amount,
         locked_amount=0,
         locksroot=EMPTY_MERKLE_ROOT,
         secret=lock_secret,
     )
     secret_message.sign(privkey2)
+    # Let's also create an invalid secret to test unlock with invalid chain id
+    invalid_secret_message = Secret(
+        chain_id=UNIT_CHAIN_ID + 1,
+        message_identifier=message_identifier,
+        payment_identifier=1,
+        nonce=2,
+        token_network_address=token_network_identifier,
+        channel_identifier=channel_state.identifier,
+        transferred_amount=transferred_amount + lock_amount,
+        locked_amount=0,
+        locksroot=EMPTY_MERKLE_ROOT,
+        secret=lock_secret,
+    )
+    invalid_secret_message.sign(privkey2)
 
     balance_proof = balanceproof_from_envelope(secret_message)
     unlock_state_change = ReceiveUnlock(
-        random.randint(0, UINT64_MAX),
-        lock_secret,
-        balance_proof,
+        message_identifier=random.randint(0, UINT64_MAX),
+        secret=lock_secret,
+        balance_proof=balance_proof,
+    )
+
+    # First test that unlock with invalid chain_id fails
+    invalid_balance_proof = balanceproof_from_envelope(invalid_secret_message)
+    invalid_unlock_state_change = ReceiveUnlock(
+        message_identifier=random.randint(0, UINT64_MAX),
+        secret=lock_secret,
+        balance_proof=invalid_balance_proof,
+    )
+    is_valid, _, _ = channel.handle_unlock(channel_state, invalid_unlock_state_change)
+    assert not is_valid, (
+        "Unlock message with chain_id different than the "
+        "channel's should fail"
     )
 
     is_valid, _, msg = channel.handle_unlock(channel_state, unlock_state_change)
@@ -725,6 +760,46 @@ def test_channelstate_directtransfer_overspent():
     assert_partner_state(channel_state.partner_state, channel_state.our_state, partner_model1)
 
 
+def test_channelstate_directtransfer_invalid_chainid():
+    """Receiving a direct transfer with a chain_id different than the channel's
+    chain_id should be ignored
+    """
+    our_model1, _ = create_model(70)
+    partner_model1, privkey2 = create_model(100)
+    channel_state = create_channel_from_models(our_model1, partner_model1)
+
+    distributable = channel.get_distributable(channel_state.partner_state, channel_state.our_state)
+
+    nonce = 1
+    transferred_amount = distributable - 1
+    receive_lockedtransfer = make_receive_transfer_direct(
+        channel_state=channel_state,
+        privkey=privkey2,
+        nonce=nonce,
+        transferred_amount=transferred_amount,
+        chain_id=UNIT_CHAIN_ID + 2,
+    )
+
+    is_valid, _ = channel.is_valid_directtransfer(
+        receive_lockedtransfer,
+        channel_state,
+        channel_state.partner_state,
+        channel_state.our_state,
+    )
+    assert not is_valid, (
+        'message is invalid because it contains different chain id than the channel'
+    )
+
+    iteration = channel.handle_receive_directtransfer(
+        channel_state,
+        receive_lockedtransfer,
+    )
+
+    assert must_contain_entry(iteration.events, EventTransferReceivedInvalidDirectTransfer, {})
+    assert_partner_state(channel_state.our_state, channel_state.partner_state, our_model1)
+    assert_partner_state(channel_state.partner_state, channel_state.our_state, partner_model1)
+
+
 def test_channelstate_lockedtransfer_overspent():
     """Receiving a lock with an amount large than distributable must be
     ignored.
@@ -759,6 +834,48 @@ def test_channelstate_lockedtransfer_overspent():
         receive_lockedtransfer,
     )
     assert not is_valid, 'message is invalid because it is spending more than the distributable'
+
+    assert_partner_state(channel_state.our_state, channel_state.partner_state, our_model1)
+    assert_partner_state(channel_state.partner_state, channel_state.our_state, partner_model1)
+
+
+def test_channelstate_lockedtransfer_invalid_chainid():
+    """Receiving a locked transfer with chain_id different from the channel's
+    chain_id should be ignored
+    """
+    our_model1, _ = create_model(70)
+    partner_model1, privkey2 = create_model(100)
+    channel_state = create_channel_from_models(our_model1, partner_model1)
+
+    distributable = channel.get_distributable(channel_state.partner_state, channel_state.our_state)
+
+    lock_amount = distributable - 1
+    lock_expiration = 10
+    lock_secrethash = sha3(b'test_channelstate_lockedtransfer_overspent')
+    lock = HashTimeLockState(
+        lock_amount,
+        lock_expiration,
+        lock_secrethash,
+    )
+
+    nonce = 1
+    transferred_amount = 0
+    receive_lockedtransfer = make_receive_transfer_mediated(
+        channel_state,
+        privkey2,
+        nonce,
+        transferred_amount,
+        lock,
+        chain_id=UNIT_CHAIN_ID + 1,
+    )
+
+    is_valid, _, _ = channel.handle_receive_lockedtransfer(
+        channel_state,
+        receive_lockedtransfer,
+    )
+    assert not is_valid, (
+        'message is invalid because it uses different chain_id than the channel'
+    )
 
     assert_partner_state(channel_state.our_state, channel_state.partner_state, our_model1)
     assert_partner_state(channel_state.partner_state, channel_state.our_state, partner_model1)
@@ -874,46 +991,49 @@ def test_invalid_timeouts():
         small_settle_timeout = 49
 
         NettingChannelState(
-            identifier,
-            token_address,
-            token_network_identifier,
-            large_reveal_timeout,
-            small_settle_timeout,
-            our_state,
-            partner_state,
-            opened_transaction,
-            closed_transaction,
-            settled_transaction,
+            identifier=identifier,
+            chain_id=UNIT_CHAIN_ID,
+            token_address=token_address,
+            token_network_identifier=token_network_identifier,
+            reveal_timeout=large_reveal_timeout,
+            settle_timeout=small_settle_timeout,
+            our_state=our_state,
+            partner_state=partner_state,
+            open_transaction=opened_transaction,
+            close_transaction=closed_transaction,
+            settle_transaction=settled_transaction,
         )
 
     # TypeError: 'a', [], {}
     for invalid_value in (-1, 0, 1.1, 1.0):
         with pytest.raises(ValueError):
             NettingChannelState(
-                identifier,
-                token_address,
-                token_network_identifier,
-                invalid_value,
-                settle_timeout,
-                our_state,
-                partner_state,
-                opened_transaction,
-                closed_transaction,
-                settled_transaction,
+                identifier=identifier,
+                chain_id=UNIT_CHAIN_ID,
+                token_address=token_address,
+                token_network_identifier=token_network_identifier,
+                reveal_timeout=invalid_value,
+                settle_timeout=settle_timeout,
+                our_state=our_state,
+                partner_state=partner_state,
+                open_transaction=opened_transaction,
+                close_transaction=closed_transaction,
+                settle_transaction=settled_transaction,
             )
 
         with pytest.raises(ValueError):
             NettingChannelState(
-                identifier,
-                token_address,
-                token_network_identifier,
-                reveal_timeout,
-                invalid_value,
-                our_state,
-                partner_state,
-                opened_transaction,
-                closed_transaction,
-                settled_transaction,
+                identifier=identifier,
+                chain_id=UNIT_CHAIN_ID,
+                token_address=token_address,
+                token_network_identifier=token_network_identifier,
+                reveal_timeout=reveal_timeout,
+                settle_timeout=invalid_value,
+                our_state=our_state,
+                partner_state=partner_state,
+                open_transaction=opened_transaction,
+                close_transaction=closed_transaction,
+                settle_transaction=settled_transaction,
             )
 
 
@@ -1024,11 +1144,12 @@ def test_interwoven_transfers():
 
             message_identifier = random.randint(0, UINT64_MAX)
             secret_message = Secret(
+                chain_id=UNIT_CHAIN_ID,
                 message_identifier=message_identifier,
                 payment_identifier=nonce,
                 nonce=nonce,
                 token_network_address=token_network_address,
-                channel=channel_state.identifier,
+                channel_identifier=channel_state.identifier,
                 transferred_amount=transferred_amount,
                 locked_amount=locked_amount,
                 locksroot=locksroot,
@@ -1038,9 +1159,9 @@ def test_interwoven_transfers():
 
             balance_proof = balanceproof_from_envelope(secret_message)
             unlock_state_change = ReceiveUnlock(
-                random.randint(0, UINT64_MAX),
-                lock_secret,
-                balance_proof,
+                message_identifier=random.randint(0, UINT64_MAX),
+                secret=lock_secret,
+                balance_proof=balance_proof,
             )
 
             is_valid, _, msg = channel.handle_unlock(channel_state, unlock_state_change)
@@ -1236,10 +1357,11 @@ def test_channelstate_get_unlock_proof():
     end_state.merkletree = MerkleTreeState(compute_layers(merkletree_leaves))
 
     unlock_proof = channel.get_batch_unlock(end_state)
-    assert len(unlock_proof) == len(end_state.merkletree.layers[LEAVES]) * 96
+    assert len(unlock_proof) == len(end_state.merkletree.layers[LEAVES])
+    leaves_packed = b''.join(lock.encoded for lock in unlock_proof)
 
     recomputed_merkle_tree = MerkleTreeState(compute_layers(
-        merkle_leaves_from_packed_data(unlock_proof),
+        merkle_leaves_from_packed_data(leaves_packed),
     ))
     assert len(recomputed_merkle_tree.layers[LEAVES]) == len(end_state.merkletree.layers[LEAVES])
 
@@ -1248,7 +1370,7 @@ def test_channelstate_get_unlock_proof():
 
 
 def test_channelstate_unlock():
-    """Event close must be properly handled if there are no locks to unlock"""
+    """The node must call unlock after the channel is settled"""
     our_model1, _ = create_model(70)
     partner_model1, privkey2 = create_model(100)
     channel_state = create_channel_from_models(our_model1, partner_model1)
@@ -1281,28 +1403,93 @@ def test_channelstate_unlock():
 
     channel.register_secret(channel_state, lock_secret, lock_secrethash)
 
-    # If the channel is closed, unlock must be done even if the lock is not
-    # at risk of expiring
     closed_block_number = lock_expiration - channel_state.reveal_timeout - 1
-    state_change = ContractReceiveChannelClosed(
+    close_state_change = ContractReceiveChannelClosed(
         channel_state.token_network_identifier,
         channel_state.identifier,
         partner_model1.participant_address,
         closed_block_number,
     )
-    iteration = channel.handle_channel_closed(channel_state, state_change)
+    iteration = channel.handle_channel_closed(channel_state, close_state_change)
+    assert not must_contain_entry(iteration.events, ContractSendChannelBatchUnlock, {})
+
+    settle_block_number = lock_expiration + channel_state.reveal_timeout + 1
+    settle_state_change = ContractReceiveChannelSettled(
+        channel_state.token_network_identifier,
+        channel_state.identifier,
+        settle_block_number,
+    )
+    iteration = channel.handle_channel_settled(
+        channel_state,
+        settle_state_change,
+        settle_block_number,
+    )
     assert must_contain_entry(iteration.events, ContractSendChannelBatchUnlock, {})
 
 
-def test_channel_unlock_must_not_change_merkletree():
+def test_refund_transfer_matches_received():
+    amount = 30
+    expiration = 50
+
+    transfer = factories.make_transfer(
+        amount,
+        UNIT_TRANSFER_INITIATOR,
+        UNIT_TRANSFER_TARGET,
+        expiration,
+        UNIT_SECRET,
+    )
+
+    refund_lower_expiration = factories.make_signed_transfer(
+        amount,
+        UNIT_TRANSFER_INITIATOR,
+        UNIT_TRANSFER_TARGET,
+        expiration - 1,
+        UNIT_SECRET,
+    )
+
+    assert channel.refund_transfer_matches_received(refund_lower_expiration, transfer) is True
+
+    refund_same_expiration = factories.make_signed_transfer(
+        amount,
+        UNIT_TRANSFER_INITIATOR,
+        UNIT_TRANSFER_TARGET,
+        expiration,
+        UNIT_SECRET,
+    )
+    assert channel.refund_transfer_matches_received(refund_same_expiration, transfer) is False
+
+
+def test_refund_transfer_does_not_match_received():
+    amount = 30
+    expiration = 50
+    target = UNIT_TRANSFER_SENDER
+    transfer = factories.make_transfer(
+        amount,
+        UNIT_TRANSFER_INITIATOR,
+        target,
+        expiration,
+        UNIT_SECRET,
+    )
+
+    refund_from_target = factories.make_signed_transfer(
+        amount,
+        UNIT_TRANSFER_INITIATOR,
+        UNIT_TRANSFER_TARGET,
+        expiration - 1,
+        UNIT_SECRET,
+    )
+    # target cannot refund
+    assert not channel.refund_transfer_matches_received(refund_from_target, transfer)
+
+
+def test_settle_transaction_must_be_sent_only_once():
     our_model1, _ = create_model(70)
     partner_model1, privkey2 = create_model(100)
     channel_state = create_channel_from_models(our_model1, partner_model1)
-    payment_network_identifier = factories.make_address()
 
-    lock_amount = 10
-    lock_expiration = 100
-    lock_secret = sha3(b'test_channelstate_lockedtransfer_overspent')
+    lock_amount = 30
+    lock_expiration = 10
+    lock_secret = sha3(b'test_settle_transaction_must_be_sent_only_once')
     lock_secrethash = sha3(lock_secret)
     lock = HashTimeLockState(
         lock_amount,
@@ -1326,28 +1513,34 @@ def test_channel_unlock_must_not_change_merkletree():
     )
     assert is_valid, msg
 
-    assert merkleroot(channel_state.partner_state.merkletree) == lock.lockhash
-    assert channel.is_lock_pending(channel_state.partner_state, lock.secrethash)
+    channel.register_secret(channel_state, lock_secret, lock_secrethash)
 
     closed_block_number = lock_expiration - channel_state.reveal_timeout - 1
-    state_change = ContractReceiveChannelClosed(
+    close_state_change = ContractReceiveChannelClosed(
         channel_state.token_network_identifier,
         channel_state.identifier,
         partner_model1.participant_address,
         closed_block_number,
     )
-    iteration = channel.handle_channel_closed(channel_state, state_change)
+    iteration = channel.handle_channel_closed(channel_state, close_state_change)
 
-    new_channel = iteration.new_state
-    unlock = ContractReceiveChannelUnlock(
-        payment_network_identifier,
-        channel_state.token_address,
+    settle_block_number = lock_expiration + channel_state.reveal_timeout + 1
+    settle_state_change = ContractReceiveChannelSettled(
+        channel_state.token_network_identifier,
         channel_state.identifier,
-        lock_secret,
-        channel_state.our_state.address,
+        settle_block_number,
     )
-    iteration = channel.handle_channel_unlock(new_channel, unlock)
+    iteration = channel.handle_channel_settled(
+        channel_state,
+        settle_state_change,
+        settle_block_number,
+    )
+    assert must_contain_entry(iteration.events, ContractSendChannelBatchUnlock, {})
 
-    new_channel = iteration.new_state
-    assert merkleroot(new_channel.partner_state.merkletree) == lock.lockhash
-    assert not channel.is_lock_pending(new_channel.partner_state, lock.secrethash)
+    iteration = channel.handle_channel_settled(
+        channel_state,
+        settle_state_change,
+        settle_block_number,
+    )
+    msg = 'BatchUnlock must be sent only once, the second transaction will always fail'
+    assert not must_contain_entry(iteration.events, ContractSendChannelBatchUnlock, {}), msg

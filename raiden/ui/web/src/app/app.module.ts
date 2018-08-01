@@ -17,6 +17,7 @@ import { ChannelTableComponent } from './components/channel-table/channel-table.
 import { EventListComponent } from './components/event-list/event-list.component';
 import { TokenNetworkComponent } from './components/token-network/token-network.component';
 import { HomeComponent } from './components/home/home.component';
+import { LicenseComponent } from './components/license/license.component';
 import { SwapDialogComponent } from './components/swap-dialog/swap-dialog.component';
 import { TransferDialogComponent } from './components/transfer-dialog/transfer-dialog.component';
 import { JoinDialogComponent } from './components/join-dialog/join-dialog.component';
@@ -30,10 +31,12 @@ import { RaidenService } from './services/raiden.service';
 import { KeysPipe } from './pipes/keys.pipe';
 import { SubsetPipe } from './pipes/subset.pipe';
 import { TokenPipe } from './pipes/token.pipe';
+import { EllipsisPipe } from './pipes/ellipsis.pipe';
 
 const appRoutes: Routes = [
     { path: '', redirectTo: '/home', pathMatch: 'full' },
     { path: 'home', component: HomeComponent },
+    { path: 'license', component: LicenseComponent },
     { path: 'tokens', component: TokenNetworkComponent },
     { path: 'channels', component: ChannelTableComponent },
 ];
@@ -50,6 +53,7 @@ export function ConfigLoader(raidenConfig: RaidenConfig) {
         EventListComponent,
         TokenNetworkComponent,
         HomeComponent,
+        LicenseComponent,
         SwapDialogComponent,
         TransferDialogComponent,
         JoinDialogComponent,
@@ -58,6 +62,7 @@ export function ConfigLoader(raidenConfig: RaidenConfig) {
         KeysPipe,
         SubsetPipe,
         TokenPipe,
+        EllipsisPipe,
     ],
     imports: [
         RouterModule.forRoot(appRoutes),

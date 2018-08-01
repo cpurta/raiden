@@ -34,11 +34,12 @@ from raiden.transfer.state import (
 )
 from raiden.transfer.state_change import (
     Block,
-    ContractReceiveChannelUnlock,
     ContractReceiveSecretReveal,
     ReceiveUnlock,
 )
-from raiden.utils import sha3
+
+from raiden.transfer.mediated_transfer import initiator
+from raiden.utils import typing
 
 # Reduce the lock expiration by some additional blocks to prevent this exploit:
 # The payee could reveal the secret on it's lock expiration block, the lock
@@ -52,21 +53,18 @@ TRANSIT_BLOCKS = 2  # TODO: make this a configuration variable
 
 STATE_SECRET_KNOWN = (
     'payee_secret_revealed',
-    'payee_refund_unlock',
     'payee_contract_unlock',
     'payee_balance_proof',
 
     'payer_secret_revealed',
     'payer_waiting_close',
     'payer_waiting_unlock',
-    'payer_contract_unlock',
     'payer_balance_proof',
 )
 STATE_TRANSFER_PAID = (
     'payee_contract_unlock',
     'payee_balance_proof',
 
-    'payer_contract_unlock',
     'payer_balance_proof',
 )
 # TODO: fix expired state, it is not final
@@ -75,7 +73,6 @@ STATE_TRANSFER_FINAL = (
     'payee_balance_proof',
     'payee_expired',
 
-    'payer_contract_unlock',
     'payer_balance_proof',
     'payer_expired',
 )
@@ -98,37 +95,6 @@ def is_safe_to_wait(lock_expiration, reveal_timeout, block_number):
     # A node may wait for a new balance proof while there are reveal_timeout
     # blocks left, at that block and onwards it is not safe to wait.
     return block_number < lock_expiration - reveal_timeout
-
-
-def is_valid_refund(
-        original_transfer: LockedTransferUnsignedState,
-        refund_transfer: LockedTransferSignedState,
-):
-    """ True if the refund transfer matches the original transfer. """
-    refund_transfer_sender = refund_transfer.balance_proof.sender
-
-    # Ignore a refund from the target
-    if refund_transfer_sender == original_transfer.target:
-        return False
-
-    return (
-        original_transfer.payment_identifier == refund_transfer.payment_identifier and
-        original_transfer.lock.amount == refund_transfer.lock.amount and
-        original_transfer.lock.secrethash == refund_transfer.lock.secrethash and
-        original_transfer.target == refund_transfer.target and
-
-        # The refund transfer is not tied to the other direction of the same
-        # channel, it may reach this node through a different route depending
-        # on the path finding strategy
-        # original_receiver == refund_transfer_sender and
-        original_transfer.token == refund_transfer.token and
-
-        # A larger-or-equal expiration is byzantine behavior that favors the
-        # receiver node, neverthless it's being ignored since the only reason
-        # for the other node to use an invalid expiration is to play the
-        # protocol.
-        original_transfer.lock.expiration > refund_transfer.lock.expiration
-    )
 
 
 def is_channel_close_needed(payer_channel, transfer_pair, block_number):
@@ -177,7 +143,16 @@ def is_send_transfer_almost_equal(
     )
 
 
-def filter_available_routes(transfers_pair, routes):
+def filter_used_routes(transfers_pair, routes):
+    """This function makes sure we filter routes that have already been used.
+
+    So in a setup like this, we want to make sure that node 2, having tried to
+    route the transfer through 3 will also try 5 before sending it backwards to 1
+
+    1 -> 2 -> 3 -> 4
+         v         ^
+         5 -> 6 -> 7
+    """
     channelid_to_route = {r.channel_identifier: r for r in routes}
 
     for pair in transfers_pair:
@@ -803,6 +778,7 @@ def events_for_unlock_if_closed(
                 lock,
             )
             unlock = ContractSendChannelBatchUnlock(
+                payer_channel.token_network_identifier,
                 payer_channel.identifier,
                 [unlock_proof],
             )
@@ -827,7 +803,6 @@ def secret_learned(
     SendBalanceProof, and Unlocks.
     """
     assert new_payee_state in STATE_SECRET_KNOWN
-    assert payee_address in (pair.payee_address for pair in state.transfers_pair)
 
     # TODO: if any of the transfers is in expired state, event for byzantine behavior
 
@@ -919,7 +894,7 @@ def mediate_transfer(
         block_number,
     )
 
-    available_routes = filter_available_routes(
+    available_routes = filter_used_routes(
         state.transfers_pair,
         possible_routes,
     )
@@ -1017,12 +992,6 @@ def handle_block(channelidentifiers_to_channels, state, state_change, block_numb
     """
     assert state_change.block_number == block_number
 
-    close_events = events_for_close(
-        channelidentifiers_to_channels,
-        state.transfers_pair,
-        block_number,
-    )
-
     secret_reveal_events = events_for_onchain_secretreveal(
         channelidentifiers_to_channels,
         state.transfers_pair,
@@ -1042,18 +1011,18 @@ def handle_block(channelidentifiers_to_channels, state, state_change, block_numb
 
     iteration = TransitionResult(
         state,
-        close_events + unlock_fail_events + secret_reveal_events,
+        unlock_fail_events + secret_reveal_events,
     )
 
     return iteration
 
 
 def handle_refundtransfer(
-        mediator_state,
+        mediator_state: MediatorTransferState,
         mediator_state_change: ReceiveTransferRefund,
-        channelidentifiers_to_channels,
-        pseudo_random_generator,
-        block_number,
+        channelidentifiers_to_channels: initiator.ChannelMap,
+        pseudo_random_generator: random.Random,
+        block_number: typing.BlockNumber,
 ):
     """ Validate and handle a ReceiveTransferRefund mediator_state change.
     A node might participate in mediated transfer more than once because of
@@ -1073,39 +1042,30 @@ def handle_refundtransfer(
     iteration = TransitionResult(mediator_state, list())
 
     if mediator_state.secret is None:
-        # The last sent transfer is the only one thay may be refunded, all the
+        # The last sent transfer is the only one that may be refunded, all the
         # previous ones are refunded already.
         transfer_pair = mediator_state.transfers_pair[-1]
         payee_transfer = transfer_pair.payee_transfer
-
-        is_valid = is_valid_refund(
-            payee_transfer,
-            mediator_state_change.transfer,
+        payer_transfer = mediator_state_change.transfer
+        channel_address = payer_transfer.balance_proof.channel_address
+        payer_channel = channelidentifiers_to_channels[channel_address]
+        is_valid, events, _ = channel.handle_refundtransfer(
+            received_transfer=payee_transfer,
+            channel_state=payer_channel,
+            refund=mediator_state_change,
         )
-        if is_valid:
-            payer_transfer = mediator_state_change.transfer
-            channel_address = payer_transfer.balance_proof.channel_address
-            payer_channel = channelidentifiers_to_channels[channel_address]
+        if not is_valid:
+            return TransitionResult(None, events)
 
-            iteration = mediate_transfer(
-                mediator_state,
-                mediator_state_change.routes,
-                payer_channel,
-                channelidentifiers_to_channels,
-                pseudo_random_generator,
-                payer_transfer,
-                block_number,
-            )
-
-            events = list(iteration.events)
-            send_processed = SendProcessed(
-                mediator_state_change.transfer.balance_proof.sender,
-                b'global',
-                mediator_state_change.message_identifier,
-            )
-            events.append(send_processed)
-
-        # else: TODO: Use an event to notify about byzantine behavior
+        iteration = mediate_transfer(
+            mediator_state,
+            mediator_state_change.routes,
+            payer_channel,
+            channelidentifiers_to_channels,
+            pseudo_random_generator,
+            payer_transfer,
+            block_number,
+        )
 
     return iteration
 
@@ -1145,77 +1105,7 @@ def handle_secretreveal(
     return iteration
 
 
-def handle_contractunlock(
-        state,
-        state_change,
-        channelidentifiers_to_channels,
-        pseudo_random_generator,
-        block_number,
-):
-    """ Handle a NettingChannelUnlock state change. """
-    assert sha3(state.secret) == state.secrethash, 'secret must be validated by the smart contract'
-
-    # For all but the last pair in transfer pair a refund transfer ocurred,
-    # meaning the same channel was used twice, once when this node sent the
-    # mediated transfer and once when the refund transfer was received. A
-    # ContractReceiveChannelUnlock state change may be used for each.
-
-    events = list()
-
-    # This node withdrew the refund
-    if state_change.receiver == state.our_address:
-        for previous_pos, pair in enumerate(state.transfers_pair, -1):
-            payer_channel = get_payer_channel(channelidentifiers_to_channels, pair)
-            if payer_channel.identifier == state_change.channel_identifier:
-                # always set the contract_unlock regardless of the previous
-                # state (even expired)
-                pair.payer_state = 'payer_contract_unlock'
-
-                unlock = EventUnlockClaimSuccess(
-                    pair.payer_transfer.payment_identifier,
-                    pair.payer_transfer.lock.secrethash,
-                )
-                events.append(unlock)
-
-                # if the current pair is backed by a refund set the sent
-                # mediated transfer to a 'secret known' state
-                if previous_pos > -1:
-                    previous_pair = state.transfers_pair[previous_pos]
-
-                    if previous_pair.payee_state not in STATE_TRANSFER_FINAL:
-                        previous_pair.payee_state = 'payee_refund_unlock'
-
-    # A partner withdrew the mediated transfer
-    else:
-        for pair in state.transfers_pair:
-            payee_channel = get_payee_channel(channelidentifiers_to_channels, pair)
-            if payee_channel.identifier == state_change.channel_identifier:
-                unlock = EventUnlockSuccess(
-                    pair.payee_transfer.payment_identifier,
-                    pair.payee_transfer.lock.secrethash,
-                )
-                events.append(unlock)
-
-                pair.payee_state = 'payee_contract_unlock'
-
-    iteration = secret_learned(
-        state,
-        channelidentifiers_to_channels,
-        pseudo_random_generator,
-        block_number,
-        state_change.secret,
-        state_change.secrethash,
-        state_change.receiver,
-        'payee_contract_unlock',
-        False,
-    )
-
-    iteration.events.extend(events)
-
-    return iteration
-
-
-def handle_unlock(mediator_state, state_change, channelidentifiers_to_channels):
+def handle_unlock(mediator_state, state_change: ReceiveUnlock, channelidentifiers_to_channels):
     """ Handle a ReceiveUnlock state change. """
     events = list()
     balance_proof_sender = state_change.balance_proof.sender
@@ -1306,15 +1196,6 @@ def state_transition(
 
     elif isinstance(state_change, ContractReceiveSecretReveal):
         iteration = handle_secretreveal(
-            mediator_state,
-            state_change,
-            channelidentifiers_to_channels,
-            pseudo_random_generator,
-            block_number,
-        )
-
-    elif isinstance(state_change, ContractReceiveChannelUnlock):
-        iteration = handle_contractunlock(
             mediator_state,
             state_change,
             channelidentifiers_to_channels,

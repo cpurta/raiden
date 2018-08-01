@@ -1,97 +1,98 @@
 import gevent.monkey
 gevent.monkey.patch_all()
 
-from binascii import hexlify
-import sys
-import os
-import tempfile
 import json
+import os
 import signal
-import shutil
+import sys
+import tempfile
+import textwrap
 import traceback
+from binascii import hexlify
 from copy import deepcopy
+from datetime import datetime
 from itertools import count
 from pathlib import Path
+from tempfile import NamedTemporaryFile
+from typing import Any, Dict
 from urllib.parse import urljoin
 
 import click
+import filelock
 import gevent
 import requests
+import structlog
 from eth_utils import (
-    to_int,
     denoms,
-    to_checksum_address,
-    to_normalized_address,
     to_canonical_address,
+    to_checksum_address,
+    to_int,
+    to_normalized_address,
 )
+from mirakuru import ProcessExitedWithError
 from requests.exceptions import RequestException
-from mirakuru import HTTPExecutor, ProcessExitedWithError
 
 from raiden import constants
 from raiden.accounts import AccountManager
 from raiden.api.rest import APIServer, RestAPI
 from raiden.exceptions import (
-    EthNodeCommunicationError,
-    ContractVersionMismatch,
+    AddressWithoutCode,
+    AddressWrongContract,
     APIServerPortInUseError,
+    ContractVersionMismatch,
+    EthNodeCommunicationError,
+    RaidenError,
     RaidenServicePortInUseError,
+    ReplacementTransactionUnderpriced,
 )
+from raiden.log_config import configure_logging
 from raiden.network.blockchain_service import BlockChainService
 from raiden.network.discovery import ContractDiscovery
-from raiden.network.matrixtransport import MatrixTransport
-from raiden.network.transport.udp.udp_transport import UDPTransport
 from raiden.network.rpc.client import JSONRPCClient
+from raiden.network.sockfactory import SocketFactory
 from raiden.network.throttle import TokenBucket
+from raiden.network.transport import MatrixTransport, UDPTransport
 from raiden.network.utils import get_free_port
 from raiden.settings import (
     DEFAULT_NAT_KEEPALIVE_RETRIES,
+    DEFAULT_TRANSPORT_RETRY_INTERVAL,
     ETHERSCAN_API,
     INITIAL_PORT,
     ORACLE_BLOCKNUMBER_DRIFT_TOLERANCE,
 )
+from raiden.tasks import check_version
 from raiden.utils import (
     eth_endpoint_to_hostport,
     get_system_spec,
-    is_minified_address,
-    is_supported_client,
     merge_dict,
     split_endpoint,
     typing,
 )
-from raiden.network.sockfactory import SocketFactory
-
 from raiden.utils.cli import (
     ADDRESS_TYPE,
-    command,
-    group,
+    LOG_LEVEL_CONFIG_TYPE,
     MatrixServerType,
     NATChoiceType,
     NetworkChoiceType,
+    PathRelativePath,
+    apply_config_file,
+    group,
     option,
     option_group,
-    LOG_LEVEL_CONFIG_TYPE,
 )
-from raiden.log_config import configure_logging
+from raiden.utils.echo_node import EchoNode
+from raiden.utils.gevent_utils import configure_gevent
+from raiden.utils.http import HTTPExecutor
+from raiden_contracts.constants import (
+    CONTRACT_ENDPOINT_REGISTRY,
+    CONTRACT_SECRET_REGISTRY,
+    CONTRACT_TOKEN_NETWORK_REGISTRY,
+)
 
 
-def check_json_rpc(blockchain_service: BlockChainService) -> None:
-    try:
-        client_version = blockchain_service.client.web3.version.node
-    except (requests.exceptions.ConnectionError, EthNodeCommunicationError):
-        print(
-            '\n'
-            'Could not contact the ethereum node through JSON-RPC.\n'
-            'Please make sure that JSON-RPC is enabled for these interfaces:\n'
-            '\n'
-            '    eth_*, net_*, web3_*\n'
-            '\n'
-            'geth: https://github.com/ethereum/go-ethereum/wiki/Management-APIs\n',
-        )
-        sys.exit(1)
-    else:
-        if not is_supported_client(client_version):
-            print('You need a Byzantium enabled ethereum node. Parity >= 1.7.6 or Geth >= 1.7.2')
-            sys.exit(1)
+log = structlog.get_logger(__name__)
+
+configure_gevent()
 
 
 def check_synced(blockchain_service: BlockChainService) -> None:
@@ -134,6 +135,7 @@ def check_discovery_registration_gas(
     discovery_tx_cost = blockchain_service.client.gasprice() * constants.DISCOVERY_TX_GAS_LIMIT
     account_balance = blockchain_service.client.balance(account_address)
 
+    # pylint: disable=no-member
     if discovery_tx_cost > account_balance:
         print(
             'Account has insufficient funds for discovery registration.\n'
@@ -170,7 +172,7 @@ def wait_for_sync_etherscan(
 ) -> None:
     local_block = blockchain_service.client.block_number()
     etherscan_block = etherscan_query_with_retries(url, sleep)
-    syncing_str = 'Syncing ... Current: {} / Target: ~{}'
+    syncing_str = '\rSyncing ... Current: {} / Target: ~{}'
 
     if local_block >= etherscan_block - tolerance:
         return
@@ -190,8 +192,10 @@ def wait_for_sync_etherscan(
             if local_block >= etherscan_block - tolerance:
                 return
 
-        print(constants.ANSI_ESCAPE_CLEARLINE + constants.ANSI_ESCAPE_CURSOR_STARTLINE, end='')
         print(syncing_str.format(local_block, etherscan_block), end='')
+
+    # add a newline so that the next print will start have it's own line
+    print('')
 
 
 def wait_for_sync_rpc_api(
@@ -205,7 +209,7 @@ def wait_for_sync_rpc_api(
 
     for i in count():
         if i % 3 == 0:
-            print(constants.ANSI_ESCAPE_CLEARLINE + constants.ANSI_ESCAPE_CURSOR_STARTLINE, end='')
+            print('\r', end='')
 
         print('.', end='')
         sys.stdout.flush()
@@ -214,6 +218,9 @@ def wait_for_sync_rpc_api(
 
         if blockchain_service.is_synced():
             return
+
+    # add a newline so that the next print will start have it's own line
+    print('')
 
 
 def wait_for_sync(
@@ -235,6 +242,30 @@ def wait_for_sync(
         wait_for_sync_rpc_api(blockchain_service, sleep)
 
 
+def handle_contract_version_mismatch(name: str, address: typing.Address) -> None:
+    hex_addr = to_checksum_address(address)
+    print(
+        f'Error: Provided {name} {hex_addr} contract version mismatch. '
+        'Please update your Raiden installation.',
+    )
+    sys.exit(1)
+
+
+def handle_contract_no_code(name: str, address: typing.Address) -> None:
+    hex_addr = to_checksum_address(address)
+    print(f'Error: Provided {name} {hex_addr} contract does not contain code')
+    sys.exit(1)
+
+
+def handle_contract_wrong_address(name: str, address: typing.Address) -> None:
+    hex_addr = to_checksum_address(address)
+    print(
+        f'Error: Provided address {hex_addr} for {name} contract'
+        ' does not contain expected code.',
+    )
+    sys.exit(1)
+
+
 def options(func):
     """Having the common app options as a decorator facilitates reuse."""
 
@@ -252,6 +283,19 @@ def options(func):
                 writable=True,
                 resolve_path=True,
                 allow_dash=False,
+            ),
+            show_default=True,
+        ),
+        option(
+            '--config-file',
+            help='Configuration file (TOML)',
+            default=os.path.join('${datadir}', 'config.toml'),
+            type=PathRelativePath(
+                file_okay=True,
+                dir_okay=False,
+                exists=False,
+                readable=True,
+                resolve_path=True,
             ),
             show_default=True,
         ),
@@ -285,21 +329,18 @@ def options(func):
         option(
             '--registry-contract-address',
             help='hex encoded address of the registry contract.',
-            default=constants.ROPSTEN_REGISTRY_ADDRESS,  # testnet default
             type=ADDRESS_TYPE,
             show_default=True,
         ),
         option(
             '--secret-registry-contract-address',
             help='hex encoded address of the secret registry contract.',
-            default=constants.ROPSTEN_SECRET_REGISTRY_ADDRESS,  # testnet default
             type=ADDRESS_TYPE,
             show_default=True,
         ),
         option(
             '--discovery-contract-address',
             help='hex encoded address of the discovery contract.',
-            default=constants.ROPSTEN_DISCOVERY_ADDRESS,  # testnet default
             type=ADDRESS_TYPE,
             show_default=True,
         ),
@@ -312,7 +353,7 @@ def options(func):
             '--transport',
             help='Transport system to use. Matrix is experimental.',
             type=click.Choice(['udp', 'matrix']),
-            default='udp',
+            default='matrix',
             show_default=True,
         ),
         option(
@@ -443,6 +484,14 @@ def options(func):
                 help='Output log lines in JSON format',
                 is_flag=True,
             ),
+            option(
+                '--disable-debug-logfile',
+                help=(
+                    'Disable the debug logfile feature. This is independent of '
+                    'the normal logging setup'
+                ),
+                is_flag=True,
+            ),
         ),
         option_group(
             'RPC Options',
@@ -483,9 +532,7 @@ def options(func):
     return func
 
 
-@options
-@command()
-def app(
+def run_app(
         address,
         keystore_path,
         gas_price,
@@ -494,13 +541,8 @@ def app(
         secret_registry_contract_address,
         discovery_contract_address,
         listen_address,
-        rpccorsdomain,
         mapped_socket,
-        log_config,
-        log_file,
-        log_json,
         max_unresponsive_time,
-        send_ping_time,
         api_address,
         rpc,
         sync_check,
@@ -508,11 +550,11 @@ def app(
         password_file,
         web_ui,
         datadir,
-        nat,
         transport,
         matrix_server,
         network_id,
         extra_config=None,
+        **kwargs,
 ):
     # pylint: disable=too-many-locals,too-many-branches,too-many-statements,unused-argument
 
@@ -566,9 +608,6 @@ def app(
 
     blockchain_service = BlockChainService(privatekey_bin, rpc_client)
 
-    # this assumes the eth node is already online
-    check_json_rpc(blockchain_service)
-
     net_id = blockchain_service.network_id
     if net_id != network_id:
         if network_id in constants.ID_TO_NETWORKNAME and net_id in constants.ID_TO_NETWORKNAME:
@@ -583,52 +622,76 @@ def app(
             ).format(network_id, net_id))
         sys.exit(1)
 
+    config['chain_id'] = network_id
+
     if sync_check:
         check_synced(blockchain_service)
 
     database_path = os.path.join(datadir, 'netid_%s' % net_id, address_hex[:8], 'log.db')
     config['database_path'] = database_path
     print(
-        'You are connected to the \'{}\' network and the DB path is: {}'.format(
+        '\nYou are connected to the \'{}\' network and the DB path is: {}'.format(
             constants.ID_TO_NETWORKNAME.get(net_id) or net_id,
             database_path,
         ),
     )
 
+    contract_addresses_given = (
+        registry_contract_address is not None and
+        secret_registry_contract_address is not None and
+        discovery_contract_address is not None
+    )
+    contract_addresses_known = net_id in constants.ID_TO_NETWORK_CONFIG
+
+    if not contract_addresses_given and not contract_addresses_known:
+        print((
+              "There are known contract addresses for network id '{}'. Please provide "
+              'them in the command line or the configuration file.'
+              ).format(net_id))
+        sys.exit(1)
+
+    contract_addresses = constants.ID_TO_NETWORK_CONFIG.get(net_id, dict())
+
     try:
-        registry = blockchain_service.registry(
-            registry_contract_address,
+        token_network_registry = blockchain_service.token_network_registry(
+            registry_contract_address or contract_addresses[CONTRACT_TOKEN_NETWORK_REGISTRY],
         )
     except ContractVersionMismatch:
-        print(
-            'Deployed registry contract version mismatch. '
-            'Please update your Raiden installation.',
-        )
-        sys.exit(1)
+        handle_contract_version_mismatch('token network registry', registry_contract_address)
+    except AddressWithoutCode:
+        handle_contract_no_code('token network registry', registry_contract_address)
+    except AddressWrongContract:
+        handle_contract_wrong_address('token network registry', registry_contract_address)
 
     try:
         secret_registry = blockchain_service.secret_registry(
-            secret_registry_contract_address,
+            secret_registry_contract_address or contract_addresses[CONTRACT_SECRET_REGISTRY],
         )
     except ContractVersionMismatch:
-        print(
-            'Deployed secret registry contract version mismatch. '
-            'Please update your Raiden installation.',
-        )
-        sys.exit(1)
+        handle_contract_version_mismatch('secret registry', secret_registry_contract_address)
+    except AddressWithoutCode:
+        handle_contract_no_code('secret registry', secret_registry_contract_address)
+    except AddressWrongContract:
+        handle_contract_wrong_address('secret registry', secret_registry_contract_address)
 
     discovery = None
     if transport == 'udp':
         check_discovery_registration_gas(blockchain_service, address)
         try:
+            dicovery_proxy = blockchain_service.discovery(
+                discovery_contract_address or contract_addresses[CONTRACT_ENDPOINT_REGISTRY],
+            )
             discovery = ContractDiscovery(
                 blockchain_service.node_address,
-                blockchain_service.discovery(discovery_contract_address),
+                dicovery_proxy,
             )
         except ContractVersionMismatch:
-            print('Deployed discovery contract version mismatch. '
-                  'Please update your Raiden installation.')
-            sys.exit(1)
+            handle_contract_version_mismatch('discovery', discovery_contract_address)
+        except AddressWithoutCode:
+            handle_contract_no_code('discovery', discovery_contract_address)
+        except AddressWrongContract:
+            handle_contract_wrong_address('discovery', discovery_contract_address)
+
         throttle_policy = TokenBucket(
             config['transport']['throttle_capacity'],
             config['transport']['throttle_fill_rate'],
@@ -641,18 +704,42 @@ def app(
             config['transport'],
         )
     elif transport == 'matrix':
-        transport = MatrixTransport(config['matrix'])
+        # matrix gets spammed with the default retry-interval of 1s, wait a little more
+        if config['transport']['retry_interval'] == DEFAULT_TRANSPORT_RETRY_INTERVAL:
+            config['transport']['retry_interval'] *= 5
+        try:
+            transport = MatrixTransport(config['matrix'])
+        except RaidenError as ex:
+            click.secho(f'FATAL: {ex}', fg='red')
+            sys.exit(1)
     else:
         raise RuntimeError(f'Unknown transport type "{transport}" given')
 
-    raiden_app = App(
-        config,
-        blockchain_service,
-        registry,
-        secret_registry,
-        transport,
-        discovery,
-    )
+    try:
+        chain_config = constants.ID_TO_NETWORK_CONFIG.get(net_id, {})
+        start_block = chain_config.get(constants.START_QUERY_BLOCK_KEY, 0)
+        raiden_app = App(
+            config=config,
+            chain=blockchain_service,
+            query_start_block=start_block,
+            default_registry=token_network_registry,
+            default_secret_registry=secret_registry,
+            transport=transport,
+            discovery=discovery,
+        )
+    except RaidenError as e:
+        click.secho(f'FATAL: {e}', fg='red')
+        sys.exit(1)
+
+    try:
+        raiden_app.start()
+    except filelock.Timeout:
+        name_or_id = constants.ID_TO_NETWORKNAME.get(network_id, network_id)
+        print(
+            f'FATAL: Another Raiden instance already running for account {address_hex} on '
+            f'network id {name_or_id}',
+        )
+        sys.exit(1)
 
     return raiden_app
 
@@ -660,7 +747,12 @@ def app(
 def prompt_account(address_hex, keystore_path, password_file):
     accmgr = AccountManager(keystore_path)
     if not accmgr.accounts:
-        raise RuntimeError('No Ethereum accounts found in the user\'s system')
+        print(
+            'No Ethereum accounts found in the provided keystore directory {}. '
+            'Please provide a directory containing valid ethereum account '
+            'files.'.format(keystore_path),
+        )
+        sys.exit(1)
 
     if not accmgr.address_in_keystore(address_hex):
         # check if an address has been passed
@@ -694,8 +786,10 @@ def prompt_account(address_hex, keystore_path, password_file):
 
     password = None
     if password_file:
-        password = password_file.read().splitlines()[0]
-    if password:
+        password = password_file.read()
+        if password != '':
+            password = password.splitlines()[0]
+    if password is not None:
         try:
             privatekey_bin = accmgr.get_privkey(address_hex, password)
         except ValueError:
@@ -727,57 +821,126 @@ def prompt_account(address_hex, keystore_path, password_file):
     return address_hex, privatekey_bin
 
 
-@group(invoke_without_command=True, context_settings={'max_content_width': 120})
-@options
-@click.pass_context
-def run(ctx, **kwargs):
-    # pylint: disable=too-many-locals,too-many-branches,too-many-statements
+class NodeRunner:
+    def __init__(self, options: Dict[str, Any], ctx):
+        self._options = options
+        self._ctx = ctx
+        self._raiden_api = None
 
-    if ctx.invoked_subcommand is not None:
-        # Pass parsed args on to subcommands.
-        ctx.obj = kwargs
-        return
+    @property
+    def _welcome_string(self):
+        return f"Welcome to Raiden, version {get_system_spec()['raiden']}!"
 
-    print('Welcome to Raiden, version {}!'.format(get_system_spec()['raiden']))
-    from raiden.ui.console import Console
-    from raiden.api.python import RaidenAPI
+    def _startup_hook(self):
+        """ Hook that is called after startup is finished. Intended for subclass usage. """
+        pass
 
-    configure_logging(
-        kwargs['log_config'],
-        log_json=kwargs['log_json'],
-        log_file=kwargs['log_file'],
-    )
+    def _shutdown_hook(self):
+        """ Hook that is called just before shutdown. Intended for subclass usage. """
+        pass
 
-    # TODO:
-    # - Ask for confirmation to quit if there are any locked transfers that did
-    # not timeout.
+    def run(self):
+        click.secho(self._welcome_string, fg='green')
+        click.secho(
+            textwrap.dedent(
+                '''\
+                ----------------------------------------------------------------------
+                | This is an Alpha version of experimental open source software      |
+                | released under the MIT license and may contain errors and/or bugs. |
+                | Use of the software is at your own risk and discretion. No         |
+                | guarantee whatsoever is made regarding its suitability for your    |
+                | intended purposes and its compliance with applicable law and       |
+                | regulations. It is up to the user to determine the software´s      |
+                | quality and suitability and whether its use is compliant with its  |
+                | respective regulatory regime, especially in the case that you are  |
+                | operating in a commercial context.                                 |
+                ----------------------------------------------------------------------''',
+            ),
+            fg='yellow',
+        )
+        configure_logging(
+            self._options['log_config'],
+            log_json=self._options['log_json'],
+            log_file=self._options['log_file'],
+            disable_debug_logfile=self._options['disable_debug_logfile'],
+        )
 
-    def _run_app():
+        if self._options['config_file']:
+            log.debug('Using config file', config_file=self._options['config_file'])
+
+        # TODO:
+        # - Ask for confirmation to quit if there are any locked transfers that did
+        # not timeout.
+        try:
+            if self._options['transport'] == 'udp':
+                (listen_host, listen_port) = split_endpoint(self._options['listen_address'])
+                try:
+                    with SocketFactory(
+                        listen_host, listen_port, strategy=self._options['nat'],
+                    ) as mapped_socket:
+                        self._options['mapped_socket'] = mapped_socket
+                        app = self._run_app()
+
+                except RaidenServicePortInUseError:
+                    print(
+                        'ERROR: Address %s:%s is in use. '
+                        'Use --listen-address <host:port> to specify port to listen on.' %
+                        (listen_host, listen_port),
+                    )
+                    sys.exit(1)
+            elif self._options['transport'] == 'matrix':
+                self._options['mapped_socket'] = None
+                app = self._run_app()
+            else:
+                # Shouldn't happen
+                raise RuntimeError(f"Invalid transport type '{self._options['transport']}'")
+            app.stop(leave_channels=False)
+        except ReplacementTransactionUnderpriced as e:
+            print(
+                '{}. Please make sure that this Raiden node is the '
+                'only user of the selected account'.format(str(e)),
+            )
+            sys.exit(1)
+
+    def _run_app(self):
+        from raiden.ui.console import Console
+        from raiden.api.python import RaidenAPI
+
         # this catches exceptions raised when waiting for the stalecheck to complete
         try:
-            app_ = ctx.invoke(app, **kwargs)
+            app_ = run_app(**self._options)
         except EthNodeCommunicationError:
+            print(
+                '\n'
+                'Could not contact the ethereum node through JSON-RPC.\n'
+                'Please make sure that JSON-RPC is enabled for these interfaces:\n'
+                '\n'
+                '    eth_*, net_*, web3_*\n'
+                '\n'
+                'geth: https://github.com/ethereum/go-ethereum/wiki/Management-APIs\n',
+            )
             sys.exit(1)
 
         domain_list = []
-        if kwargs['rpccorsdomain']:
-            if ',' in kwargs['rpccorsdomain']:
-                for domain in kwargs['rpccorsdomain'].split(','):
+        if self._options['rpccorsdomain']:
+            if ',' in self._options['rpccorsdomain']:
+                for domain in self._options['rpccorsdomain'].split(','):
                     domain_list.append(str(domain))
             else:
-                domain_list.append(str(kwargs['rpccorsdomain']))
+                domain_list.append(str(self._options['rpccorsdomain']))
+
+        self._raiden_api = RaidenAPI(app_.raiden)
 
         api_server = None
-        if ctx.params['rpc']:
-            raiden_api = RaidenAPI(app_.raiden)
-            rest_api = RestAPI(raiden_api)
+        if self._options['rpc']:
+            rest_api = RestAPI(self._raiden_api)
             api_server = APIServer(
                 rest_api,
                 cors_domain_list=domain_list,
-                web_ui=ctx.params['web_ui'],
-                eth_rpc_endpoint=ctx.params['eth_rpc_endpoint'],
+                web_ui=self._options['web_ui'],
+                eth_rpc_endpoint=self._options['eth_rpc_endpoint'],
             )
-            (api_host, api_port) = split_endpoint(kwargs['api_address'])
+            (api_host, api_port) = split_endpoint(self._options['api_address'])
 
             try:
                 api_server.start(api_host, api_port)
@@ -798,9 +961,14 @@ def run(ctx, **kwargs):
                 ),
             )
 
-        if ctx.params['console']:
+        if self._options['console']:
             console = Console(app_)
             console.start()
+
+        # spawning a thread to handle the version checking
+        gevent.spawn(check_version)
+
+        self._startup_hook()
 
         # wait for interrupt
         event = gevent.event.Event()
@@ -808,38 +976,65 @@ def run(ctx, **kwargs):
         gevent.signal(signal.SIGTERM, event.set)
         gevent.signal(signal.SIGINT, event.set)
 
-        event.wait()
-        print('Signal received. Shutting down ...')
-        if api_server:
-            api_server.stop()
+        try:
+            event.wait()
+            print('Signal received. Shutting down ...')
+        except RaidenError as ex:
+            click.secho(f'FATAL: {ex}', fg='red')
+        except Exception as ex:
+            with NamedTemporaryFile(
+                'w',
+                prefix=f'raiden-exception-{datetime.utcnow():%Y-%m-%dT%H-%M}',
+                suffix='.txt',
+                delete=False,
+            ) as traceback_file:
+                traceback.print_exc(file=traceback_file)
+                click.secho(
+                    f'FATAL: An unexpected exception occured.'
+                    f'A traceback has been written to {traceback_file.name}\n'
+                    f'{ex}',
+                    fg='red',
+                )
+        finally:
+            self._shutdown_hook()
+            if api_server:
+                api_server.stop()
 
         return app_
 
-    # TODO:
-    # - Ask for confirmation to quit if there are any locked transfers that did
-    # not timeout.
-    if kwargs['transport'] == 'udp':
-        (listen_host, listen_port) = split_endpoint(kwargs['listen_address'])
-        try:
-            with SocketFactory(listen_host, listen_port, strategy=kwargs['nat']) as mapped_socket:
-                kwargs['mapped_socket'] = mapped_socket
-                app_ = _run_app()
 
-        except RaidenServicePortInUseError:
-            print(
-                'ERROR: Address %s:%s is in use. '
-                'Use --listen-address <host:port> to specify port to listen on.' %
-                (listen_host, listen_port),
-            )
-            sys.exit(1)
-    elif kwargs['transport'] == 'matrix':
-        print('WARNING: The Matrix transport is experimental')
-        kwargs['mapped_socket'] = None
-        app_ = _run_app()
-    else:
-        # Shouldn't happen
-        raise RuntimeError(f"Invalid transport type '{kwargs['transport']}'")
-    app_.stop(leave_channels=False)
+class EchoNodeRunner(NodeRunner):
+    def __init__(self, options: Dict[str, Any], ctx, token_address: typing.TokenAddress):
+        super().__init__(options, ctx)
+        self._token_address = token_address
+        self._echo_node = None
+
+    @property
+    def _welcome_string(self):
+        return '{} [ECHO NODE]'.format(super(EchoNodeRunner, self)._welcome_string)
+
+    def _startup_hook(self):
+        self._echo_node = EchoNode(self._raiden_api, self._token_address)
+
+    def _shutdown_hook(self):
+        self._echo_node.stop()
+
+
+@group(invoke_without_command=True, context_settings={'max_content_width': 120})
+@options
+@click.pass_context
+def run(ctx, **kwargs):
+    # pylint: disable=too-many-locals,too-many-branches,too-many-statements
+
+    if kwargs['config_file']:
+        apply_config_file(run, kwargs, ctx)
+
+    if ctx.invoked_subcommand is not None:
+        # Pass parsed args on to subcommands.
+        ctx.obj = kwargs
+        return
+
+    NodeRunner(kwargs, ctx).run()
 
 
 @run.command()
@@ -874,33 +1069,13 @@ def version(short, **kwargs):  # pylint: disable=unused-argument
 @click.pass_context
 def smoketest(ctx, debug, local_matrix, **kwargs):  # pylint: disable=unused-argument
     """ Test, that the raiden installation is sane. """
-    import binascii
-    from web3 import Web3, HTTPProvider
-    from web3.middleware import geth_poa_middleware
     from raiden.api.python import RaidenAPI
-    from raiden.blockchain.abi import get_static_or_compile
-    from raiden.network.proxies.registry import Registry
-    from raiden.tests.utils.geth import geth_wait_and_check
-    from raiden.tests.integration.contracts.fixtures.contracts import deploy_token
     from raiden.tests.utils.smoketest import (
         TEST_PARTNER_ADDRESS,
         TEST_DEPOSIT_AMOUNT,
-        deploy_smoketest_contracts,
-        get_private_key,
         load_smoketest_config,
-        start_ethereum,
         run_smoketests,
-    )
-    from raiden.utils import get_contract_path
-
-    # Check the solidity compiler early in the smoketest.
-    #
-    # Binary distributions don't need the solidity compiler but source
-    # distributions do. Since this is checked by `get_static_or_compile`
-    # function, use it as a proxy for validating the setup.
-    get_static_or_compile(
-        get_contract_path('HumanStandardToken.sol'),
-        'HumanStandardToken',
+        setup_testchain_and_raiden,
     )
 
     report_file = tempfile.mktemp(suffix='.log')
@@ -940,98 +1115,63 @@ def smoketest(ctx, debug, local_matrix, **kwargs):  # pylint: disable=unused-arg
             'Could not load the smoketest genesis configuration file.',
         )
 
-    print_step('Starting Ethereum node')
-    ethereum, ethereum_config = start_ethereum(smoketest_config['genesis'])
-    port = ethereum_config['rpc']
-    web3_client = Web3(HTTPProvider(f'http://0.0.0.0:{port}'))
-    web3_client.middleware_stack.inject(geth_poa_middleware, layer=0)
-    random_marker = binascii.hexlify(b'raiden').decode()
-    privatekeys = []
-    geth_wait_and_check(web3_client, privatekeys, random_marker)
-
-    print_step('Deploying Raiden contracts')
-    host = '0.0.0.0'
-    client = JSONRPCClient(
-        host,
-        ethereum_config['rpc'],
-        get_private_key(),
-        web3=web3_client,
+    result = setup_testchain_and_raiden(
+        smoketest_config,
+        ctx.parent.params['transport'],
+        ctx.parent.params['matrix_server'],
+        print_step,
     )
-    contract_addresses = deploy_smoketest_contracts(client)
+    args = result['args']
+    contract_addresses = result['contract_addresses']
+    token = result['token']
+    ethereum = result['ethereum']
+    ethereum_config = result['ethereum_config']
 
-    token_contract = deploy_token(None, client)
-    token = token_contract(1000, 0, 'TKN', 'TKN')
-
-    registry = Registry(
-        client,
-        contract_addresses['Registry'],
-    )
-
-    registry.add_token(to_canonical_address(token.contract.address))
-
-    print_step('Setting up Raiden')
-    # setup cli arguments for starting raiden
-    args = dict(
-        discovery_contract_address=to_checksum_address(contract_addresses['EndpointRegistry']),
-        registry_contract_address=to_checksum_address(contract_addresses['Registry']),
-        secret_registry_contract_address=to_checksum_address(contract_addresses['SecretRegistry']),
-        eth_rpc_endpoint='http://127.0.0.1:{}'.format(port),
-        keystore_path=ethereum_config['keystore'],
-        address=ethereum_config['address'],
-        network_id='627',
-        transport=ctx.parent.params['transport'],
-        matrix_server='http://localhost:8008'
-                      if ctx.parent.params['matrix_server'] == 'auto'
-                      else ctx.parent.params['matrix_server'],
-    )
     smoketest_config['transport'] = args['transport']
-    for option_ in app.params:
+    for option_ in run.params:
         if option_.name in args.keys():
             args[option_.name] = option_.process_value(ctx, args[option_.name])
         else:
             args[option_.name] = option_.default
 
-    password_file = os.path.join(args['keystore_path'], 'password')
-    with open(password_file, 'w') as handler:
-        handler.write('password')
-
     port = next(get_free_port('127.0.0.1', 5001))
-    args['password_file'] = click.File()(password_file)
-    args['datadir'] = args['keystore_path']
+
     args['api_address'] = 'localhost:' + str(port)
-    args['sync_check'] = False
 
     def _run_smoketest():
         print_step('Starting Raiden')
 
         # invoke the raiden app
-        app_ = ctx.invoke(app, **args)
+        app = run_app(**args)
 
-        raiden_api = RaidenAPI(app_.raiden)
+        raiden_api = RaidenAPI(app.raiden)
         rest_api = RestAPI(raiden_api)
         api_server = APIServer(rest_api)
         (api_host, api_port) = split_endpoint(args['api_address'])
         api_server.start(api_host, api_port)
 
         raiden_api.channel_open(
-            contract_addresses['Registry'],
+            contract_addresses[CONTRACT_TOKEN_NETWORK_REGISTRY],
             to_canonical_address(token.contract.address),
             to_canonical_address(TEST_PARTNER_ADDRESS),
             None,
             None,
         )
         raiden_api.set_total_channel_deposit(
-            contract_addresses['Registry'],
+            contract_addresses[CONTRACT_TOKEN_NETWORK_REGISTRY],
             to_canonical_address(token.contract.address),
             to_canonical_address(TEST_PARTNER_ADDRESS),
             TEST_DEPOSIT_AMOUNT,
         )
 
         smoketest_config['contracts']['registry_address'] = to_checksum_address(
-            contract_addresses['Registry'],
+            contract_addresses[CONTRACT_TOKEN_NETWORK_REGISTRY],
+        )
+        smoketest_config['contracts']['secret_registry_address'] = to_checksum_address(
+            contract_addresses[CONTRACT_SECRET_REGISTRY],
         )
         smoketest_config['contracts']['discovery_address'] = to_checksum_address(
-            contract_addresses['EndpointRegistry'],
+            contract_addresses[CONTRACT_ENDPOINT_REGISTRY],
         )
         smoketest_config['contracts']['token_address'] = to_checksum_address(
             token.contract.address,
@@ -1040,13 +1180,13 @@ def smoketest(ctx, debug, local_matrix, **kwargs):  # pylint: disable=unused-arg
         success = False
         try:
             print_step('Running smoketest')
-            error = run_smoketests(app_.raiden, smoketest_config, debug=debug)
+            error = run_smoketests(app.raiden, smoketest_config, debug=debug)
             if error is not None:
                 append_report('Smoketest assertion error', error)
             else:
                 success = True
         finally:
-            app_.stop()
+            app.stop()
             ethereum.send_signal(2)
 
             err, out = ethereum.communicate()
@@ -1066,14 +1206,14 @@ def smoketest(ctx, debug, local_matrix, **kwargs):  # pylint: disable=unused-arg
             args['mapped_socket'] = mapped_socket
             success = _run_smoketest()
     elif args['transport'] == 'matrix' and local_matrix.lower() != 'none':
-        print('WARNING: The Matrix transport is experimental')
         args['mapped_socket'] = None
         print_step('Starting Matrix transport')
         try:
             with HTTPExecutor(
                 local_matrix,
-                status=r'^[24]\d\d$',
                 url=urljoin(args['matrix_server'], '/_matrix/client/versions'),
+                method='GET',
+                timeout=30,
                 shell=True,
             ):
                 args['extra_config'] = {
@@ -1091,7 +1231,6 @@ def smoketest(ctx, debug, local_matrix, **kwargs):  # pylint: disable=unused-arg
             )
             success = False
     elif args['transport'] == 'matrix' and local_matrix.lower() == "none":
-        print('WARNING: The Matrix transport is experimental')
         args['mapped_socket'] = None
         success = _run_smoketest()
     else:
@@ -1102,53 +1241,16 @@ def smoketest(ctx, debug, local_matrix, **kwargs):  # pylint: disable=unused-arg
         sys.exit(1)
 
 
-def _removedb(netdir, address_hex):
-    user_db_dir = os.path.join(netdir, address_hex[:8]) if address_hex else netdir
-
-    if not os.path.exists(user_db_dir):
-        return False
-
-    # Sanity check if the specified directory is a Raiden datadir.
-    sane = True
-    if not address_hex:
-        ls = os.listdir(user_db_dir)
-        sane = all(
-            is_minified_address(f) and
-            len(f) == 8 and
-            os.path.isdir(os.path.join(user_db_dir, f))
-            for f in ls
-        )
-
-    if not sane:
-        print('WARNING: The specified directory does not appear to be a Raiden data directory.')
-
-    prompt = 'Are you sure you want to delete {}?'.format(user_db_dir)
-
-    if click.confirm(prompt):
-        shutil.rmtree(user_db_dir)
-        print('Local data deleted.')
-    else:
-        print('Aborted.')
-
-    return True
-
-
-@run.command()
+@run.command(
+    help=(
+        'Start an echo node.\n'
+        'Mainly useful for development.\n'
+        'See: https://raiden-network.readthedocs.io/en/stable/api_walkthrough.html'
+        '#interacting-with-the-raiden-echo-node'
+    ),
+)
+@click.option('--token-address', type=ADDRESS_TYPE, required=True)
 @click.pass_context
-def removedb(ctx):
-    """Delete local cache and database of this address or all if none is specified."""
-
-    datadir = ctx.obj['datadir']
-    address = ctx.obj['address']
-    address_hex = to_normalized_address(address) if address else None
-
-    result = False
-    for f in os.listdir(datadir):
-        netdir = os.path.join(datadir, f)
-        if os.path.isdir(netdir):
-            if _removedb(netdir, address_hex):
-                result = True
-
-    if not result:
-        print('No raiden databases found for {}'.format(address_hex))
-        print('Nothing to delete.')
+def echonode(ctx, token_address):
+    """ Start a raiden Echo Node that will send received transfers back to the initiator. """
+    EchoNodeRunner(ctx.obj, ctx, token_address).run()

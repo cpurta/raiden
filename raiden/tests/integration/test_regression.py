@@ -2,7 +2,6 @@ import random
 
 import gevent
 import pytest
-import os
 
 from raiden.constants import UINT64_MAX
 from raiden.messages import (
@@ -16,8 +15,9 @@ from raiden.tests.integration.fixtures.raiden_network import (
     wait_for_channels,
 )
 from raiden.tests.integration.fixtures.transport import TransportProtocol
-from raiden.tests.utils.network import netting_channel_open_and_deposit
+from raiden.tests.utils.network import payment_channel_open_and_deposit
 from raiden.tests.utils.transfer import get_channelstate
+from raiden.tests.utils.factories import UNIT_CHAIN_ID
 from raiden.transfer import views
 from raiden.transfer.mediated_transfer.events import SendRevealSecret
 from raiden.transfer.state import EMPTY_MERKLE_ROOT
@@ -28,11 +28,7 @@ from raiden.utils import sha3
 
 @pytest.mark.parametrize('number_of_nodes', [5])
 @pytest.mark.parametrize('channels_per_node', [0])
-@pytest.mark.parametrize('settle_timeout', [32])  # default settlement is too low for 3 hops
-@pytest.mark.skipif(
-    'TRAVIS' in os.environ,
-    reason='Missing events cause stuck test & exit due to test timeout on Travis. Issue #1502',
-)
+@pytest.mark.parametrize('settle_timeout', [64])  # default settlement is too low for 3 hops
 def test_regression_unfiltered_routes(
         raiden_network,
         token_addresses,
@@ -64,7 +60,7 @@ def test_regression_unfiltered_routes(
     greenlets = []
     for first_app, second_app in app_channels:
         greenlets.append(gevent.spawn(
-            netting_channel_open_and_deposit,
+            payment_channel_open_and_deposit,
             first_app,
             second_app,
             token,
@@ -184,19 +180,20 @@ def test_regression_multiple_revealsecret(raiden_network, token_addresses, trans
     nonce = 1
     transferred_amount = 0
     mediated_transfer = LockedTransfer(
-        random.randint(0, UINT64_MAX),
-        payment_identifier,
-        nonce,
-        app0.raiden.default_registry.address,
-        token,
-        channelstate_0_1.identifier,
-        transferred_amount,
-        lock_amount,
-        app1.raiden.address,
-        lock.secrethash,
-        lock,
-        app1.raiden.address,
-        app0.raiden.address,
+        chain_id=UNIT_CHAIN_ID,
+        message_identifier=random.randint(0, UINT64_MAX),
+        payment_identifier=payment_identifier,
+        nonce=nonce,
+        token_network_address=app0.raiden.default_registry.address,
+        token=token,
+        channel_identifier=channelstate_0_1.identifier,
+        transferred_amount=transferred_amount,
+        locked_amount=lock_amount,
+        recipient=app1.raiden.address,
+        locksroot=lock.secrethash,
+        lock=lock,
+        target=app1.raiden.address,
+        initiator=app0.raiden.address,
     )
     app0.raiden.sign(mediated_transfer)
 
@@ -216,11 +213,12 @@ def test_regression_multiple_revealsecret(raiden_network, token_addresses, trans
 
     token_network_identifier = channelstate_0_1.token_network_identifier
     secret = Secret(
+        chain_id=UNIT_CHAIN_ID,
         message_identifier=random.randint(0, UINT64_MAX),
         payment_identifier=payment_identifier,
         nonce=mediated_transfer.nonce + 1,
         token_network_address=token_network_identifier,
-        channel=channelstate_0_1.identifier,
+        channel_identifier=channelstate_0_1.identifier,
         transferred_amount=lock_amount,
         locked_amount=0,
         locksroot=EMPTY_MERKLE_ROOT,

@@ -1,14 +1,14 @@
-import gevent
 from contextlib import ExitStack
+
 import structlog
-from eth_utils import is_binary_address
+from eth_utils import is_binary_address, to_checksum_address
 
 from raiden import waiting
 from raiden.blockchain.events import (
     ALL_EVENTS,
-    get_all_registry_events,
     get_all_netting_channel_events,
-    get_all_channel_manager_events,
+    get_token_network_events,
+    get_token_network_registry_events,
 )
 from raiden.transfer import views
 from raiden.transfer.events import (
@@ -16,26 +16,26 @@ from raiden.transfer.events import (
     EventTransferSentFailed,
     EventTransferReceivedSuccess,
 )
+from raiden.transfer.state import NettingChannelState
 from raiden.transfer.state_change import ActionChannelClose
 from raiden.exceptions import (
     AlreadyRegisteredTokenAddress,
-    ChannelBusyError,
     ChannelNotFound,
-    EthNodeCommunicationError,
     InsufficientFunds,
     InvalidAddress,
     InvalidAmount,
     InvalidSettleTimeout,
     UnknownTokenAddress,
+    DepositOverLimit,
+    DuplicatedChannelError,
+    TokenNotRegistered,
 )
-from raiden.settings import (
-    DEFAULT_POLL_TIMEOUT,
-    DEFAULT_RETRY_TIMEOUT,
-)
+from raiden.settings import DEFAULT_RETRY_TIMEOUT
 from raiden.utils import (
     pex,
-    releasing,
+    typing,
 )
+from raiden.api.rest import hexbytes_to_str, encode_byte_values
 
 log = structlog.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -50,31 +50,52 @@ class RaidenAPI:
     # pylint: disable=too-many-public-methods
 
     def __init__(self, raiden):
+        # We cannot accept requests before the node has synchronized with the
+        # blockchain, which is done during the call to RaidenService.start.
+        # Otherwise there is no guarantee that the node is in a valid state and
+        # that the actions are valid, e.g. deposit in a channel that has closed
+        # while the node was offline.
+        if not raiden.start_event.is_set():
+            raise RuntimeError(
+                'The RaidenService must be started before the API can be used',
+            )
         self.raiden = raiden
 
     @property
     def address(self):
         return self.raiden.address
 
-    # XXX: This interface will break once the channel identifiers are not addresses
-    def get_channel(self, registry_address, channel_address):
-        if not is_binary_address(channel_address):
-            raise InvalidAddress('Expected binary address format for channel in get_channel')
+    def get_channel(
+        self,
+        registry_address: typing.PaymentNetworkID,
+        token_address: typing.TokenAddress,
+        partner_address: typing.Address,
+    ) -> NettingChannelState:
+        if not is_binary_address(token_address):
+            raise InvalidAddress('Expected binary address format for token in get_channel')
 
-        channel_list = self.get_channel_list(registry_address)
-        for channel in channel_list:
-            if channel.identifier == channel_address:
-                return channel
+        if not is_binary_address(partner_address):
+            raise InvalidAddress('Expected binary address format for partner in get_channel')
 
-        raise ChannelNotFound()
+        channel_list = self.get_channel_list(registry_address, token_address, partner_address)
+        assert len(channel_list) <= 1
+
+        if not channel_list:
+            raise ChannelNotFound(
+                "Channel with partner '{}' for token '{}' could not be found.".format(
+                    to_checksum_address(partner_address),
+                    to_checksum_address(token_address),
+                ),
+            )
+
+        return channel_list[0]
 
     def token_network_register(
             self,
-            registry_address,
-            token_address,
-            poll_timeout=DEFAULT_POLL_TIMEOUT,
-            retry_timeout=DEFAULT_RETRY_TIMEOUT,
-    ):
+            registry_address: typing.PaymentNetworkID,
+            token_address: typing.TokenAddress,
+            retry_timeout: typing.NetworkTimeout = DEFAULT_RETRY_TIMEOUT,
+    ) -> typing.TokenNetworkAddress:
         """Register the `token_address` in the blockchain. If the address is already
            registered but the event has not been processed this function will block
            until the next block to make sure the event is processed.
@@ -97,14 +118,9 @@ class RaidenAPI:
             raise AlreadyRegisteredTokenAddress('Token already registered')
 
         try:
-            registry = self.raiden.chain.registry(registry_address)
+            registry = self.raiden.chain.token_network_registry(registry_address)
 
-            msg = 'After {} seconds the channel was not properly created.'.format(
-                poll_timeout,
-            )
-
-            with gevent.Timeout(poll_timeout, EthNodeCommunicationError(msg)):
-                return registry.add_token(token_address)
+            return registry.add_token(token_address)
         finally:
             # Assume the transaction failed because the token is already
             # registered with the smart contract and this node has not yet
@@ -118,27 +134,34 @@ class RaidenAPI:
 
     def token_network_connect(
             self,
-            registry_address,
-            token_address,
-            funds,
-            initial_channel_target=3,
-            joinable_funds_target=.4,
-    ):
-        """Automatically maintain channels open for the given token network.
+            registry_address: typing.PaymentNetworkID,
+            token_address: typing.TokenAddress,
+            funds: typing.TokenAmount,
+            initial_channel_target: int = 3,
+            joinable_funds_target: float = 0.4,
+    ) -> None:
+        """ Automatically maintain channels open for the given token network.
 
         Args:
-            token_address (bin): the ERC20 token network to connect to.
-            funds (int): the amount of funds that can be used by the ConnectionMananger.
-            initial_channel_target (int): number of channels to open proactively.
-            joinable_funds_target (float): fraction of the funds that will be used to join
+            token_address: the ERC20 token network to connect to.
+            funds: the amount of funds that can be used by the ConnectionMananger.
+            initial_channel_target: number of channels to open proactively.
+            joinable_funds_target: fraction of the funds that will be used to join
                 channels opened by other participants.
         """
+        if not is_binary_address(registry_address):
+            raise InvalidAddress('registry_address must be a valid address in binary')
         if not is_binary_address(token_address):
             raise InvalidAddress('token_address must be a valid address in binary')
 
-        connection_manager = self.raiden.connection_manager_for_token(
-            registry_address,
-            token_address,
+        token_network_identifier = views.get_token_network_identifier_by_token_address(
+            views.state_from_raiden(self.raiden),
+            payment_network_id=registry_address,
+            token_address=token_address,
+        )
+
+        connection_manager = self.raiden.connection_manager_for_token_network(
+            token_network_identifier,
         )
 
         connection_manager.connect(
@@ -147,31 +170,41 @@ class RaidenAPI:
             joinable_funds_target=joinable_funds_target,
         )
 
-    def token_network_leave(self, registry_address, token_address, only_receiving=True):
-        """Close all channels and wait for settlement."""
+    def token_network_leave(
+            self,
+            registry_address: typing.PaymentNetworkID,
+            token_address: typing.TokenAddress,
+    ) -> typing.List[NettingChannelState]:
+        """ Close all channels and wait for settlement. """
+        if not is_binary_address(registry_address):
+            raise InvalidAddress('registry_address must be a valid address in binary')
         if not is_binary_address(token_address):
             raise InvalidAddress('token_address must be a valid address in binary')
 
         if token_address not in self.get_tokens_list(registry_address):
             raise UnknownTokenAddress('token_address unknown')
 
-        connection_manager = self.raiden.connection_manager_for_token(
-            registry_address,
-            token_address,
+        token_network_identifier = views.get_token_network_identifier_by_token_address(
+            views.state_from_raiden(self.raiden),
+            payment_network_id=registry_address,
+            token_address=token_address,
         )
 
-        return connection_manager.leave(only_receiving)
+        connection_manager = self.raiden.connection_manager_for_token_network(
+            token_network_identifier,
+        )
+
+        return connection_manager.leave(registry_address)
 
     def channel_open(
             self,
-            registry_address,
-            token_address,
-            partner_address,
-            settle_timeout=None,
-            reveal_timeout=None,
-            poll_timeout=DEFAULT_POLL_TIMEOUT,
-            retry_timeout=DEFAULT_RETRY_TIMEOUT,
-    ):
+            registry_address: typing.PaymentNetworkID,
+            token_address: typing.TokenAddress,
+            partner_address: typing.Address,
+            settle_timeout: typing.BlockTimeout = None,
+            reveal_timeout: typing.BlockTimeout = None,
+            retry_timeout: typing.NetworkTimeout = DEFAULT_RETRY_TIMEOUT,
+    ) -> typing.ChannelID:
         """ Open a channel with the peer at `partner_address`
         with the given `token_address`.
         """
@@ -195,36 +228,61 @@ class RaidenAPI:
         if not is_binary_address(partner_address):
             raise InvalidAddress('Expected binary address format for partner in channel open')
 
-        registry = self.raiden.chain.registry(registry_address)
-        channel_manager = registry.manager_by_token(token_address)
-        netcontract_address = channel_manager.new_netting_channel(
-            partner_address,
-            settle_timeout,
-        )
-
-        msg = 'After {} seconds the channel was not properly created.'.format(
-            poll_timeout,
-        )
-
-        with gevent.Timeout(poll_timeout, EthNodeCommunicationError(msg)):
-            waiting.wait_for_newchannel(
-                self.raiden,
-                registry_address,
-                token_address,
-                partner_address,
-                retry_timeout,
-            )
-
-        return netcontract_address
-
-    def set_total_channel_deposit(
-            self,
+        chain_state = views.state_from_raiden(self.raiden)
+        channel_state = views.get_channelstate_for(
+            chain_state,
             registry_address,
             token_address,
             partner_address,
-            total_deposit,
-            poll_timeout=DEFAULT_POLL_TIMEOUT,
-            retry_timeout=DEFAULT_RETRY_TIMEOUT,
+        )
+
+        if channel_state:
+            raise DuplicatedChannelError('Channel with given partner address already exists')
+
+        registry = self.raiden.chain.token_network_registry(registry_address)
+        token_network_address = registry.get_token_network(token_address)
+
+        if token_network_address is None:
+            raise TokenNotRegistered(
+                'Token network for token %s does not exist' % to_checksum_address(token_address),
+            )
+
+        token_network = self.raiden.chain.token_network(
+            registry.get_token_network(token_address),
+        )
+
+        try:
+            token_network.new_netting_channel(
+                partner_address,
+                settle_timeout,
+            )
+        except DuplicatedChannelError:
+            log.info('partner opened channel first')
+
+        waiting.wait_for_newchannel(
+            self.raiden,
+            registry_address,
+            token_address,
+            partner_address,
+            retry_timeout,
+        )
+        chain_state = views.state_from_raiden(self.raiden)
+        channel_state = views.get_channelstate_for(
+            chain_state,
+            registry_address,
+            token_address,
+            partner_address,
+        )
+
+        return channel_state.identifier
+
+    def set_total_channel_deposit(
+            self,
+            registry_address: typing.PaymentNetworkID,
+            token_address: typing.TokenAddress,
+            partner_address: typing.Address,
+            total_deposit: typing.TokenAmount,
+            retry_timeout: typing.NetworkTimeout = DEFAULT_RETRY_TIMEOUT,
     ):
         """ Set the `total_deposit` in the channel with the peer at `partner_address` and the
         given `token_address` in order to be able to do transfers.
@@ -241,15 +299,16 @@ class RaidenAPI:
                   the deposit call.
             AddressWithoutCode: The channel was settled during the deposit
             execution.
+            DepositOverLimit: The total deposit amount is higher than the limit.
         """
-        node_state = views.state_from_raiden(self.raiden)
+        chain_state = views.state_from_raiden(self.raiden)
 
         token_networks = views.get_token_network_addresses_for(
-            node_state,
+            chain_state,
             registry_address,
         )
         channel_state = views.get_channelstate_for(
-            node_state,
+            chain_state,
             registry_address,
             token_address,
             partner_address,
@@ -268,7 +327,25 @@ class RaidenAPI:
             raise InvalidAddress('No channel with partner_address for the given token')
 
         token = self.raiden.chain.token(token_address)
+        netcontract_address = channel_state.identifier
+        token_network_registry = self.raiden.chain.token_network_registry(registry_address)
+        token_network_address = token_network_registry.get_token_network(token_address)
+        token_network_proxy = self.raiden.chain.token_network(token_network_address)
+        channel_proxy = self.raiden.chain.payment_channel(
+            token_network_proxy.address,
+            netcontract_address,
+        )
+
         balance = token.balance_of(self.raiden.address)
+
+        deposit_limit = token_network_proxy.proxy.contract.functions.deposit_limit().call()
+        if total_deposit > deposit_limit:
+            raise DepositOverLimit(
+                'The deposit of {} is bigger than the current limit of {}'.format(
+                    total_deposit,
+                    deposit_limit,
+                ),
+            )
 
         if total_deposit <= channel_state.our_state.contract_balance:
             # no action required
@@ -287,44 +364,29 @@ class RaidenAPI:
             )
             raise InsufficientFunds(msg)
 
-        netcontract_address = channel_state.identifier
-        channel_proxy = self.raiden.chain.netting_channel(netcontract_address)
-
         # If concurrent operations are happening on the channel, fail the request
-        if not channel_proxy.channel_operations_lock.acquire(blocking=False):
-            raise ChannelBusyError(
-                f'Channel with id {channel_state.identifier} is '
-                f'busy with another ongoing operation',
-            )
-
-        with releasing(channel_proxy.channel_operations_lock):
-            token.approve(netcontract_address, addendum)
+        with channel_proxy.lock_or_raise():
+            # set_total_deposit calls approve
+            # token.approve(netcontract_address, addendum)
             channel_proxy.set_total_deposit(total_deposit)
 
-            msg = 'After {} seconds the deposit was not properly processed.'.format(
-                poll_timeout,
+            target_address = self.raiden.address
+            waiting.wait_for_participant_newbalance(
+                self.raiden,
+                registry_address,
+                token_address,
+                partner_address,
+                target_address,
+                total_deposit,
+                retry_timeout,
             )
-
-            # Wait until the `ChannelNewBalance` event is processed.
-            with gevent.Timeout(poll_timeout, EthNodeCommunicationError(msg)):
-                target_address = self.raiden.address
-                waiting.wait_for_participant_newbalance(
-                    self.raiden,
-                    registry_address,
-                    token_address,
-                    partner_address,
-                    target_address,
-                    total_deposit,
-                    retry_timeout,
-                )
 
     def channel_close(
             self,
-            registry_address,
-            token_address,
-            partner_address,
-            poll_timeout=DEFAULT_POLL_TIMEOUT,
-            retry_timeout=DEFAULT_RETRY_TIMEOUT,
+            registry_address: typing.PaymentNetworkID,
+            token_address: typing.TokenAddress,
+            partner_address: typing.Address,
+            retry_timeout: typing.NetworkTimeout = DEFAULT_RETRY_TIMEOUT,
     ):
         """Close a channel opened with `partner_address` for the given
         `token_address`.
@@ -340,11 +402,10 @@ class RaidenAPI:
 
     def channel_batch_close(
             self,
-            registry_address,
-            token_address,
-            partner_addresses,
-            poll_timeout=DEFAULT_POLL_TIMEOUT,
-            retry_timeout=DEFAULT_RETRY_TIMEOUT,
+            registry_address: typing.PaymentNetworkID,
+            token_address: typing.TokenAddress,
+            partner_addresses: typing.List[typing.Address],
+            retry_timeout: typing.NetworkTimeout = DEFAULT_RETRY_TIMEOUT,
     ):
         """Close a channel opened with `partner_address` for the given
         `token_address`.
@@ -365,9 +426,9 @@ class RaidenAPI:
         if token_address not in valid_tokens:
             raise UnknownTokenAddress('Token address is not known.')
 
-        node_state = views.state_from_raiden(self.raiden)
+        chain_state = views.state_from_raiden(self.raiden)
         channels_to_close = views.filter_channels_by_partneraddress(
-            node_state,
+            chain_state,
             registry_address,
             token_address,
             partner_addresses,
@@ -384,17 +445,11 @@ class RaidenAPI:
             # Put all the locks in this outer context so that the netting channel functions
             # don't release the locks when their context goes out of scope
             for channel_state in channels_to_close:
-                channel = self.raiden.chain.netting_channel(channel_state.identifier)
-
-                # Check if we can acquire the lock. If we can't raise an exception, which
-                # will cause the ExitStack to exit, releasing all locks acquired so far
-                if not channel.channel_operations_lock.acquire(blocking=False):
-                    raise ChannelBusyError(
-                        f'Channel with id {channel_state.identifier} is '
-                        f'busy with another ongoing operation.',
-                    )
-
-                stack.push(channel.channel_operations_lock)
+                channel = self.raiden.chain.payment_channel(
+                    token_network_identifier,
+                    channel_state.identifier,
+                )
+                stack.enter_context(channel.lock_or_raise())
 
             for channel_state in channels_to_close:
                 channel_close = ActionChannelClose(
@@ -404,28 +459,28 @@ class RaidenAPI:
 
                 self.raiden.handle_state_change(channel_close)
 
-            msg = 'After {} seconds the closing transactions were not properly processed.'.format(
-                poll_timeout,
-            )
-
             channel_ids = [channel_state.identifier for channel_state in channels_to_close]
 
-            with gevent.Timeout(poll_timeout, EthNodeCommunicationError(msg)):
-                waiting.wait_for_close(
-                    self.raiden,
-                    registry_address,
-                    token_address,
-                    channel_ids,
-                    retry_timeout,
-                )
+            waiting.wait_for_close(
+                self.raiden,
+                registry_address,
+                token_address,
+                channel_ids,
+                retry_timeout,
+            )
 
-    def get_channel_list(self, registry_address, token_address=None, partner_address=None):
+    def get_channel_list(
+            self,
+            registry_address: typing.PaymentNetworkID,
+            token_address: typing.TokenAddress = None,
+            partner_address: typing.Address = None,
+    ) -> typing.List[NettingChannelState]:
         """Returns a list of channels associated with the optionally given
            `token_address` and/or `partner_address`.
 
         Args:
-            token_address (bin): an optionally provided token address
-            partner_address (bin): an optionally provided partner address
+            token_address: an optionally provided token address
+            partner_address: an optionally provided partner address
 
         Return:
             A list containing all channels the node participates. Optionally
@@ -434,6 +489,8 @@ class RaidenAPI:
         Raises:
             KeyError: An error occurred when the token address is unknown to the node.
         """
+        if registry_address and not is_binary_address(registry_address):
+            raise InvalidAddress('Expected binary address format for registry in get_channel_list')
 
         if token_address and not is_binary_address(token_address):
             raise InvalidAddress('Expected binary address format for token in get_channel_list')
@@ -476,18 +533,18 @@ class RaidenAPI:
 
         return result
 
-    def get_node_network_state(self, node_address):
+    def get_node_network_state(self, node_address: typing.Address):
         """ Returns the currently network status of `node_address`. """
         return views.get_node_network_status(
             views.state_from_raiden(self.raiden),
             node_address,
         )
 
-    def start_health_check_for(self, node_address):
+    def start_health_check_for(self, node_address: typing.Address):
         """ Returns the currently network status of `node_address`. """
         self.raiden.start_health_check_for(node_address)
 
-    def get_tokens_list(self, registry_address):
+    def get_tokens_list(self, registry_address: typing.PaymentNetworkID):
         """Returns a list of tokens the node knows about"""
         tokens_list = views.get_token_network_addresses_for(
             views.state_from_raiden(self.raiden),
@@ -497,12 +554,12 @@ class RaidenAPI:
 
     def transfer_and_wait(
             self,
-            registry_address,
-            token_address,
-            amount,
-            target,
-            identifier=None,
-            transfer_timeout=None,
+            registry_address: typing.PaymentNetworkID,
+            token_address: typing.TokenAddress,
+            amount: typing.TokenAmount,
+            target: typing.Address,
+            identifier: int = None,
+            transfer_timeout: int = None,
     ):
         """ Do a transfer with `target` with the given `amount` of `token_address`. """
         # pylint: disable=too-many-arguments
@@ -518,11 +575,11 @@ class RaidenAPI:
 
     def transfer_async(
             self,
-            registry_address,
-            token_address,
-            amount,
-            target,
-            identifier=None,
+            registry_address: typing.PaymentNetworkID,
+            token_address: typing.TokenAddress,
+            amount: typing.TokenAmount,
+            target: typing.Address,
+            identifier: int = None,
     ):
 
         if not isinstance(amount, int):
@@ -567,31 +624,49 @@ class RaidenAPI:
         )
         return async_result
 
-    def get_network_events(self, registry_address, from_block, to_block):
-        return get_all_registry_events(
+    def get_network_events(
+            self, registry_address: typing.PaymentNetworkID,
+            from_block: typing.BlockSpecification = 0,
+            to_block: typing.BlockSpecification = 'latest',
+    ):
+        return sorted(get_token_network_registry_events(
             self.raiden.chain,
             registry_address,
             events=ALL_EVENTS,
             from_block=from_block,
             to_block=to_block,
-        )
+        ), key=lambda evt: evt.get('block_number'), reverse=True)
 
-    def get_channel_events(self, channel_address, from_block, to_block='latest'):
-        if not is_binary_address(channel_address):
-            raise InvalidAddress(
-                'Expected binary address format for channel in get_channel_events',
-            )
-        returned_events = get_all_netting_channel_events(
-            self.raiden.chain,
-            channel_address,
-            events=ALL_EVENTS,
-            from_block=from_block,
-            to_block=to_block,
+    def get_channel_events(
+            self,
+            token_address: typing.TokenAddress,
+            partner_address: typing.Address = None,
+            from_block: typing.BlockSpecification = 0,
+            to_block: typing.BlockSpecification = 'latest',
+    ):
+        token_network_address = self.raiden.default_registry.get_token_network(
+            token_address,
         )
+        channel_list = self.get_channel_list(
+            registry_address=self.raiden.default_registry.address,
+            token_address=token_address,
+            partner_address=partner_address,
+        )
+        returned_events = []
+        for channel in channel_list:
+            returned_events.extend(get_all_netting_channel_events(
+                self.raiden.chain,
+                token_network_address,
+                channel.identifier,
+                from_block=from_block,
+                to_block=to_block,
+            ))
+
         raiden_events = self.raiden.wal.storage.get_events_by_block(
             from_block=from_block,
             to_block=to_block,
         )
+
         # Here choose which raiden internal events we want to expose to the end user
         for block_number, event in raiden_events:
             if isinstance(event, EVENTS_EXTERNALLY_VISIBLE):
@@ -602,27 +677,41 @@ class RaidenAPI:
                 new_event.update(event.__dict__)
                 returned_events.append(new_event)
 
+        returned_events.sort(key=lambda evt: evt.get('block_number'), reverse=True)
         return returned_events
 
-    def get_token_network_events(self, token_address, from_block, to_block='latest'):
-
+    def get_token_network_events(
+            self,
+            token_address: typing.TokenAddress,
+            from_block: typing.BlockSpecification = 0,
+            to_block: typing.BlockSpecification = 'latest',
+    ):
         if not is_binary_address(token_address):
             raise InvalidAddress(
                 'Expected binary address format for token in get_token_network_events',
             )
-        channel_manager_address = self.raiden.default_registry.manager_address_by_token(
+        token_network_address = self.raiden.default_registry.get_token_network(
             token_address,
         )
-        if channel_manager_address is None:
+        if token_network_address is None:
             raise UnknownTokenAddress('Token address is not known.')
 
-        returned_events = get_all_channel_manager_events(
+        returned_events = get_token_network_events(
             self.raiden.chain,
-            channel_manager_address,
+            token_network_address,
             events=ALL_EVENTS,
             from_block=from_block,
             to_block=to_block,
         )
+
+        for event in returned_events:
+            if event.get('args'):
+                event['args'] = dict(event['args'])
+
+                # the channel_identifier is a hash
+                encode_byte_values(event['args'])
+
+            hexbytes_to_str(event)
 
         raiden_events = self.raiden.wal.storage.get_events_by_block(
             from_block=from_block,
@@ -639,6 +728,7 @@ class RaidenAPI:
                 new_event.update(event.__dict__)
                 returned_events.append(new_event)
 
+        returned_events.sort(key=lambda evt: evt.get('block_number'), reverse=True)
         return returned_events
 
     transfer = transfer_and_wait

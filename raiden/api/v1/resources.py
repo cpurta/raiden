@@ -2,7 +2,7 @@ from webargs.flaskparser import use_kwargs
 from flask_restful import Resource
 from flask import Blueprint
 from raiden.api.v1.encoding import (
-    ChannelRequestSchema,
+    ChannelPutSchema,
     ChannelPatchSchema,
     EventRequestSchema,
     TransferSchema,
@@ -36,9 +36,7 @@ class AddressResource(BaseResource):
 
 class ChannelsResource(BaseResource):
 
-    put_schema = ChannelRequestSchema(
-        exclude=('channel_address', 'state'),
-    )
+    put_schema = ChannelPutSchema
 
     def get(self):
         """
@@ -56,7 +54,7 @@ class ChannelsResource(BaseResource):
         )
 
 
-class ChannelsResourceByChannelAddress(BaseResource):
+class ChannelsResourceByTokenAndPartnerAddress(BaseResource):
 
     patch_schema = ChannelPatchSchema
 
@@ -100,6 +98,8 @@ class NetworkEventsResource(BaseResource):
 
     @use_kwargs(get_schema, locations=('query',))
     def get(self, from_block, to_block):
+        from_block = from_block or self.rest_api.raiden_api.raiden.query_start_block
+        to_block = to_block or 'latest'
         return self.rest_api.get_network_events(
             registry_address=self.rest_api.raiden_api.raiden.default_registry.address,
             from_block=from_block,
@@ -113,6 +113,8 @@ class TokenEventsResource(BaseResource):
 
     @use_kwargs(get_schema, locations=('query',))
     def get(self, token_address, from_block, to_block):
+        from_block = from_block or self.rest_api.raiden_api.raiden.query_start_block
+        to_block = to_block or 'latest'
         return self.rest_api.get_token_network_events(
             token_address=token_address,
             from_block=from_block,
@@ -125,9 +127,12 @@ class ChannelEventsResource(BaseResource):
     get_schema = EventRequestSchema()
 
     @use_kwargs(get_schema, locations=('query',))
-    def get(self, channel_address, from_block, to_block):
+    def get(self, token_address, partner_address=None, from_block=None, to_block=None):
+        from_block = from_block or self.rest_api.raiden_api.raiden.query_start_block
+        to_block = to_block or 'latest'
         return self.rest_api.get_channel_events(
-            channel_address=channel_address,
+            token_address=token_address,
+            partner_address=partner_address,
             from_block=from_block,
             to_block=to_block,
         )
@@ -172,7 +177,6 @@ class ConnectionsResource(BaseResource):
             initial_channel_target,
             joinable_funds_target,
     ):
-
         return self.rest_api.connect(
             registry_address=self.rest_api.raiden_api.raiden.default_registry.address,
             token_address=token_address,
@@ -182,11 +186,10 @@ class ConnectionsResource(BaseResource):
         )
 
     @use_kwargs(delete_schema, locations=('json',))
-    def delete(self, token_address, only_receiving_channels):
+    def delete(self, token_address):
         return self.rest_api.leave(
             registry_address=self.rest_api.raiden_api.raiden.default_registry.address,
             token_address=token_address,
-            only_receiving=only_receiving_channels,
         )
 
 

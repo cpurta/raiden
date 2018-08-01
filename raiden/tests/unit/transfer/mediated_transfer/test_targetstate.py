@@ -484,9 +484,9 @@ def test_state_transition():
     )
 
     balance_proof_state_change = ReceiveUnlock(
-        random.randint(0, UINT64_MAX),
-        UNIT_SECRET,
-        balance_proof,
+        message_identifier=random.randint(0, UINT64_MAX),
+        secret=UNIT_SECRET,
+        balance_proof=balance_proof,
     )
 
     proof_iteration = target.state_transition(

@@ -6,23 +6,15 @@ from os import environ
 import gevent
 from gevent import server
 import structlog
-from eth_utils import decode_hex
-from raiden_contracts.constants import CONTRACT_SECRET_REGISTRY
 
 from raiden import waiting
 from raiden.app import App
 from raiden.network.blockchain_service import BlockChainService
-from raiden.network.matrixtransport import MatrixTransport
 from raiden.network.rpc.client import JSONRPCClient
 from raiden.network.throttle import TokenBucket
-from raiden.network.transport.udp.udp_transport import UDPTransport
+from raiden.network.transport import MatrixTransport, UDPTransport
 from raiden.settings import DEFAULT_RETRY_TIMEOUT
-from raiden.tests.utils.smartcontracts import deploy_contract_web3
-from raiden.utils import (
-    get_contract_path,
-    privatekey_to_address,
-)
-from raiden.utils.solc import compile_files_cwd
+from raiden.tests.utils.factories import UNIT_CHAIN_ID
 
 log = structlog.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -38,9 +30,22 @@ BlockchainServices = namedtuple(
 )
 
 
-def check_channel(app1, app2, netting_channel_address, settle_timeout, deposit_amount):
-    netcontract1 = app1.raiden.chain.netting_channel(netting_channel_address)
-    netcontract2 = app2.raiden.chain.netting_channel(netting_channel_address)
+def check_channel(
+        app1,
+        app2,
+        token_network_identifier,
+        netting_channel_address,
+        settle_timeout,
+        deposit_amount,
+):
+    netcontract1 = app1.raiden.chain.payment_channel(
+        token_network_identifier,
+        netting_channel_address,
+    )
+    netcontract2 = app2.raiden.chain.payment_channel(
+        token_network_identifier,
+        netting_channel_address,
+    )
 
     # Check a valid settle timeout was used, the netting contract has an
     # enforced minimum and maximum
@@ -57,38 +62,46 @@ def check_channel(app1, app2, netting_channel_address, settle_timeout, deposit_a
     assert app1_details['our_address'] == app2_details['partner_address']
     assert app1_details['partner_address'] == app2_details['our_address']
 
-    assert app1_details['our_balance'] == app2_details['partner_balance']
-    assert app1_details['partner_balance'] == app2_details['our_balance']
+    assert app1_details['our_deposit'] == app2_details['partner_deposit']
+    assert app1_details['partner_deposit'] == app2_details['our_deposit']
+    assert app1_details['chain_id'] == app2_details['chain_id']
 
-    assert app1_details['our_balance'] == deposit_amount
-    assert app1_details['partner_balance'] == deposit_amount
-    assert app2_details['our_balance'] == deposit_amount
-    assert app2_details['partner_balance'] == deposit_amount
+    assert app1_details['our_deposit'] == deposit_amount
+    assert app1_details['partner_deposit'] == deposit_amount
+    assert app2_details['our_deposit'] == deposit_amount
+    assert app2_details['partner_deposit'] == deposit_amount
+    assert app2_details['chain_id'] == UNIT_CHAIN_ID
 
 
-def netting_channel_open_and_deposit(app0, app1, token_address, deposit, settle_timeout):
+def payment_channel_open_and_deposit(app0, app1, token_address, deposit, settle_timeout):
     """ Open a new channel with app0 and app1 as participants """
     assert token_address
 
-    manager = app0.raiden.default_registry.manager_by_token(token_address)
-    netcontract_address = manager.new_netting_channel(
+    token_network_address = app0.raiden.default_registry.get_token_network(token_address)
+    token_network_proxy = app0.raiden.chain.token_network(token_network_address)
+
+    channel_identifier = token_network_proxy.new_netting_channel(
         app1.raiden.address,
         settle_timeout,
     )
-    assert netcontract_address
+    assert channel_identifier
 
     for app in [app0, app1]:
         # Use each app's own chain because of the private key / local signing
         token = app.raiden.chain.token(token_address)
-        netting_channel = app.raiden.chain.netting_channel(netcontract_address)
+        payment_channel_proxy = app.raiden.chain.payment_channel(
+            token_network_proxy.address,
+            channel_identifier,
+        )
 
         # This check can succeed and the deposit still fail, if channels are
         # openned in parallel
         previous_balance = token.balance_of(app.raiden.address)
         assert previous_balance >= deposit
 
-        token.approve(netcontract_address, deposit)
-        netting_channel.set_total_deposit(deposit)
+        # the payment channel proxy will call approve
+        # token.approve(token_network_proxy.address, deposit)
+        payment_channel_proxy.set_total_deposit(deposit)
 
         # Balance must decrease by at least but not exactly `deposit` amount,
         # because channels can be openned in parallel
@@ -98,7 +111,8 @@ def netting_channel_open_and_deposit(app0, app1, token_address, deposit, settle_
     check_channel(
         app0,
         app1,
-        netcontract_address,
+        token_network_proxy.address,
+        channel_identifier,
         settle_timeout,
         deposit,
     )
@@ -219,9 +233,10 @@ def create_sequential_channels(raiden_apps, channels_per_node):
 
 
 def create_apps(
+        chain_id,
         blockchain_services,
         endpoint_discovery_services,
-        registry_address,
+        token_network_registry_address,
         secret_registry_address,
         raiden_udp_ports,
         reveal_timeout,
@@ -244,13 +259,11 @@ def create_apps(
     for idx, (blockchain, discovery) in enumerate(services):
         port = raiden_udp_ports[idx]
         private_key = blockchain.private_key
-        nodeid = privatekey_to_address(private_key)
 
         host = '127.0.0.1'
 
-        discovery.register(nodeid, host, port)
-
         config = {
+            'chain_id': chain_id,
             'host': host,
             'port': port,
             'external_ip': host,
@@ -291,7 +304,7 @@ def create_apps(
         config_copy = App.DEFAULT_CONFIG.copy()
         config_copy.update(config)
 
-        registry = blockchain.registry(registry_address)
+        registry = blockchain.token_network_registry(token_network_registry_address)
         secret_registry = blockchain.secret_registry(secret_registry_address)
 
         if use_matrix:
@@ -310,12 +323,13 @@ def create_apps(
             )
 
         app = App(
-            config_copy,
-            blockchain,
-            registry,
-            secret_registry,
-            transport,
-            discovery,
+            config=config_copy,
+            chain=blockchain,
+            query_start_block=0,
+            default_registry=registry,
+            default_secret_registry=secret_registry,
+            transport=transport,
+            discovery=discovery,
         )
         apps.append(app)
 
@@ -323,43 +337,21 @@ def create_apps(
 
 
 def jsonrpc_services(
-        deploy_key,
-        deploy_client,
+        deploy_service,
         private_keys,
+        secret_registry_address,
+        token_network_registry_address,
         web3=None,
 ):
-    deploy_blockchain = BlockChainService(deploy_key, deploy_client)
-
-    secret_registry_address = deploy_contract_web3(
-        CONTRACT_SECRET_REGISTRY,
-        deploy_client,
-    )
-    secret_registry = deploy_blockchain.secret_registry(secret_registry_address)  # noqa
-
-    registry_path = get_contract_path('Registry.sol')
-    registry_contracts = compile_files_cwd([registry_path])
-
-    log.info('Deploying registry contract')
-    registry_proxy = deploy_client.deploy_solidity_contract(
-        'Registry',
-        registry_contracts,
-        dict(),
-        tuple(),
-        contract_path=registry_path,
-    )
-    registry_address = decode_hex(registry_proxy.contract.address)
-
-    # at this point the blockchain must be running, this will overwrite the
-    # method so even if the client is patched twice, it should work fine
-
-    deploy_registry = deploy_blockchain.registry(registry_address)
+    secret_registry = deploy_service.secret_registry(secret_registry_address)
+    deploy_registry = deploy_service.token_network_registry(token_network_registry_address)
 
     host = '0.0.0.0'
     blockchain_services = list()
     for privkey in private_keys:
         rpc_client = JSONRPCClient(
             host,
-            deploy_client.port,
+            deploy_service.client.port,
             privkey,
             web3=web3,
         )
@@ -370,7 +362,7 @@ def jsonrpc_services(
     return BlockchainServices(
         deploy_registry,
         secret_registry,
-        deploy_blockchain,
+        deploy_service,
         blockchain_services,
     )
 

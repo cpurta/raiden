@@ -12,6 +12,7 @@ from raiden.tests.utils.geth import wait_until_block
 from raiden.tests.utils.factories import (
     make_address,
     make_privkey_address,
+    UNIT_CHAIN_ID,
     UNIT_SECRETHASH,
 )
 from raiden.tests.utils.network import CHAIN
@@ -86,6 +87,7 @@ def test_failfast_lockedtransfer_nochannel(raiden_network, token_addresses):
 @pytest.mark.parametrize('channels_per_node', [CHAIN])
 def test_receive_lockedtransfer_invalidnonce(
         raiden_network,
+        number_of_nodes,
         deposit,
         token_addresses,
         reveal_timeout,
@@ -107,7 +109,7 @@ def test_receive_lockedtransfer_invalidnonce(
         app2,
         token_network_identifier,
         amount,
-        timeout=network_wait,
+        timeout=network_wait * number_of_nodes,
     )
 
     amount = 10
@@ -115,12 +117,13 @@ def test_receive_lockedtransfer_invalidnonce(
     repeated_nonce = 1
     expiration = reveal_timeout * 2
     mediated_transfer_message = LockedTransfer(
+        chain_id=UNIT_CHAIN_ID,
         message_identifier=random.randint(0, UINT64_MAX),
         payment_identifier=payment_identifier,
         nonce=repeated_nonce,
         token_network_address=token_network_identifier,
         token=token_address,
-        channel=channel0.identifier,
+        channel_identifier=channel0.identifier,
         transferred_amount=amount,
         locked_amount=amount,
         recipient=app1.raiden.address,
@@ -169,12 +172,13 @@ def test_receive_lockedtransfer_invalidsender(
     lock_amount = 10
     expiration = reveal_timeout * 2
     mediated_transfer_message = LockedTransfer(
+        chain_id=UNIT_CHAIN_ID,
         message_identifier=random.randint(0, UINT64_MAX),
         payment_identifier=1,
         nonce=1,
         token_network_address=token_network_identifier,
         token=token_address,
-        channel=channel0.identifier,
+        channel_identifier=channel0.identifier,
         transferred_amount=0,
         locked_amount=lock_amount,
         recipient=app0.raiden.address,
@@ -222,12 +226,13 @@ def test_receive_lockedtransfer_invalidrecipient(
     lock_amount = 10
     expiration = reveal_timeout * 2
     mediated_transfer_message = LockedTransfer(
+        chain_id=UNIT_CHAIN_ID,
         message_identifier=random.randint(0, UINT64_MAX),
         payment_identifier=payment_identifier,
         nonce=1,
         token_network_address=token_network_identifier,
         token=token_address,
-        channel=channel0.identifier,
+        channel_identifier=channel0.identifier,
         transferred_amount=0,
         locked_amount=lock_amount,
         recipient=invalid_recipient,
@@ -288,12 +293,13 @@ def test_received_lockedtransfer_closedchannel(
     payment_identifier = 1
     expiration = reveal_timeout * 2
     mediated_transfer_message = LockedTransfer(
+        chain_id=UNIT_CHAIN_ID,
         message_identifier=random.randint(0, UINT64_MAX),
         payment_identifier=payment_identifier,
         nonce=1,
         token_network_address=token_network_identifier,
         token=token_address,
-        channel=channel0.identifier,
+        channel_identifier=channel0.identifier,
         transferred_amount=0,
         locked_amount=lock_amount,
         recipient=app1.raiden.address,

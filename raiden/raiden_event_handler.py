@@ -1,9 +1,10 @@
 import structlog
 
-from raiden.messages import (
-    message_from_sendevent,
-    Lock,
+from raiden.exceptions import (
+    ChannelIncorrectStateError,
+    ChannelOutdatedError,
 )
+from raiden.messages import message_from_sendevent
 from raiden.transfer.architecture import Event
 from raiden.transfer.events import (
     ContractSendSecretReveal,
@@ -11,6 +12,7 @@ from raiden.transfer.events import (
     ContractSendChannelSettle,
     ContractSendChannelUpdateTransfer,
     ContractSendChannelBatchUnlock,
+    EventTransferReceivedInvalidDirectTransfer,
     EventTransferReceivedSuccess,
     EventTransferSentFailed,
     EventTransferSentSuccess,
@@ -30,11 +32,13 @@ from raiden.transfer.mediated_transfer.events import (
 )
 from raiden.transfer.balance_proof import signing_update_data
 from raiden.utils import pex
+from raiden.constants import EMPTY_HASH, EMPTY_SIGNATURE
 # type alias to avoid both circular dependencies and flake8 errors
 RaidenService = 'RaidenService'
 
 log = structlog.get_logger(__name__)  # pylint: disable=invalid-name
 UNEVENTFUL_EVENTS = (
+    EventTransferReceivedInvalidDirectTransfer,
     EventTransferReceivedSuccess,
     EventUnlockSuccess,
     EventUnlockClaimFailed,
@@ -179,82 +183,45 @@ def handle_contract_send_channelclose(
 
     if balance_proof:
         nonce = balance_proof.nonce
-        transferred_amount = balance_proof.transferred_amount
-        locked_amount = balance_proof.locked_amount
-        locksroot = balance_proof.locksroot
-        signature = balance_proof.signature
-        message_hash = balance_proof.message_hash
-
-    else:
-        nonce = 0
-        transferred_amount = 0
-        locked_amount = 0
-        locksroot = b''
-        signature = b''
-        message_hash = b''
-
-    channel = raiden.chain.netting_channel(channel_close_event.channel_identifier)
-
-    channel.close(
-        nonce,
-        transferred_amount,
-        locked_amount,
-        locksroot,
-        message_hash,
-        signature,
-    )
-
-
-def handle_contract_send_channelclose2(
-        raiden: RaidenService,
-        channel_close_event: ContractSendChannelClose,
-):
-    balance_proof = channel_close_event.balance_proof
-
-    if balance_proof:
-        nonce = balance_proof.nonce
         balance_hash = balance_proof.balance_hash
         signature = balance_proof.signature
         message_hash = balance_proof.message_hash
 
     else:
         nonce = 0
-        balance_hash = b''
-        signature = b''
-        message_hash = b''
+        balance_hash = EMPTY_HASH
+        signature = EMPTY_SIGNATURE
+        message_hash = EMPTY_HASH
 
-    channel = raiden.chain.payment_channel(
+    channel_proxy = raiden.chain.payment_channel(
         token_network_address=channel_close_event.token_network_identifier,
         channel_id=channel_close_event.channel_identifier,
     )
 
-    channel.close(
-        nonce,
-        balance_hash,
-        message_hash,
-        signature,
-    )
+    try:
+        channel_proxy.close(
+            nonce,
+            balance_hash,
+            message_hash,
+            signature,
+        )
+    except ChannelIncorrectStateError:
+        # This may happen for two reasons:
+        # - The channel was also closed by the partner and this transaction
+        # lost the race
+        # - The ActionCloseChannel was processed in a previous run, and the the
+        # node was restarted, so the channel is already closed but the
+        # blockchain event to update the local state was not processed yet
+        msg = 'Channel with {partner_address} for token {token_address} is already closed'.format(
+            partner_address=pex(channel_proxy.participant2),
+            token_address=pex(channel_proxy.token_address()),
+        )
+        log.info(msg)
+    except ChannelOutdatedError as e:
+        log.error(str(e))
 
 
 def handle_contract_send_channelupdate(
-        raiden: RaidenService,
-        channel_update_event: ContractSendChannelUpdateTransfer,
-):
-    balance_proof = channel_update_event.balance_proof
-
-    if balance_proof:
-        channel = raiden.chain.netting_channel(channel_update_event.channel_identifier)
-        channel.update_transfer(
-            balance_proof.nonce,
-            balance_proof.transferred_amount,
-            balance_proof.locked_amount,
-            balance_proof.locksroot,
-            balance_proof.message_hash,
-            balance_proof.signature,
-        )
-
-
-def handle_contract_send_channelupdate2(
         raiden: RaidenService,
         channel_update_event: ContractSendChannelUpdateTransfer,
 ):
@@ -268,53 +235,36 @@ def handle_contract_send_channelupdate2(
 
         our_signature = signing_update_data(
             balance_proof,
-            raiden.chain.network_id,
             raiden.privkey,
         )
 
-        channel.update_transfer(
-            balance_proof.nonce,
-            balance_proof.balance_hash,
-            balance_proof.message_hash,
-            balance_proof.signature,
-            our_signature,
-        )
+        try:
+            channel.update_transfer(
+                balance_proof.nonce,
+                balance_proof.balance_hash,
+                balance_proof.message_hash,
+                balance_proof.signature,
+                our_signature,
+            )
+        except ChannelOutdatedError as e:
+            log.error(str(e))
 
 
 def handle_contract_send_channelunlock(
         raiden: RaidenService,
         channel_unlock_event: ContractSendChannelBatchUnlock,
 ):
-    channel = raiden.chain.netting_channel(channel_unlock_event.channel_identifier)
-    block_number = raiden.get_block_number()
-
-    for unlock_proof in channel_unlock_event.unlock_proofs:
-        lock = Lock.from_bytes(unlock_proof.lock_encoded)
-
-        if lock.expiration < block_number:
-            log.error('Lock has expired!', lock=lock)
-        else:
-            channel.unlock(unlock_proof)
-
-
-def handle_contract_send_channelunlock2(
-        raiden: RaidenService,
-        channel_unlock_event: ContractSendChannelBatchUnlock,
-):
-    channel = raiden.chain.netting_channel(channel_unlock_event.channel_identifier)
-
-    channel.unlock(channel_unlock_event.unlock_proofs)
+    channel = raiden.chain.payment_channel(
+        channel_unlock_event.token_network_identifier,
+        channel_unlock_event.channel_identifier,
+    )
+    try:
+        channel.unlock(channel_unlock_event.merkle_treee_leaves)
+    except ChannelOutdatedError as e:
+        log.error(str(e))
 
 
 def handle_contract_send_channelsettle(
-        raiden: RaidenService,
-        channel_settle_event: ContractSendChannelSettle,
-):
-    channel = raiden.chain.netting_channel(channel_settle_event.channel_identifier)
-    channel.settle()
-
-
-def handle_contract_send_channelsettle2(
         raiden: RaidenService,
         channel_settle_event: ContractSendChannelSettle,
 ):
@@ -325,14 +275,60 @@ def handle_contract_send_channelsettle2(
     our_balance_proof = channel_settle_event.our_balance_proof
     partner_balance_proof = channel_settle_event.partner_balance_proof
 
-    channel.settle(
-        our_balance_proof.transferred_amount,
-        our_balance_proof.locked_amount,
-        our_balance_proof.locksroot,
-        partner_balance_proof.transferred_amount,
-        partner_balance_proof.locked_amount,
-        partner_balance_proof.locksroot,
-    )
+    if our_balance_proof:
+        our_transferred_amount = our_balance_proof.transferred_amount
+        our_locked_amount = our_balance_proof.locked_amount
+        our_locksroot = our_balance_proof.locksroot
+    else:
+        our_transferred_amount = 0
+        our_locked_amount = 0
+        our_locksroot = EMPTY_HASH
+
+    if partner_balance_proof:
+        partner_transferred_amount = partner_balance_proof.transferred_amount
+        partner_locked_amount = partner_balance_proof.locked_amount
+        partner_locksroot = partner_balance_proof.locksroot
+    else:
+        partner_transferred_amount = 0
+        partner_locked_amount = 0
+        partner_locksroot = EMPTY_HASH
+
+    our_max_transferred = our_transferred_amount + our_locked_amount
+    partner_max_transferred = partner_transferred_amount + partner_locked_amount
+
+    # The smart contract requires the max transferred of the /first/ balance
+    # proof to be /smaller/.
+    if our_max_transferred < partner_max_transferred:
+        first_transferred_amount = our_transferred_amount
+        first_locked_amount = our_locked_amount
+        first_locksroot = our_locksroot
+        second_transferred_amount = partner_transferred_amount
+        second_locked_amount = partner_locked_amount
+        second_locksroot = partner_locksroot
+    else:
+        first_transferred_amount = partner_transferred_amount
+        first_locked_amount = partner_locked_amount
+        first_locksroot = partner_locksroot
+        second_transferred_amount = our_transferred_amount
+        second_locked_amount = our_locked_amount
+        second_locksroot = our_locksroot
+
+    try:
+        channel.settle(
+            first_transferred_amount,
+            first_locked_amount,
+            first_locksroot,
+            second_transferred_amount,
+            second_locked_amount,
+            second_locksroot,
+        )
+    except ChannelIncorrectStateError as e:
+        # Ignoring the exception as there might
+        # be a race condition when both nodes try to settle
+        # at the same time.
+        log.error('settle failed', reason=str(e))
+    except ChannelOutdatedError as e:
+        log.error(str(e))
 
 
 def on_raiden_event(raiden: RaidenService, event: Event):
@@ -362,15 +358,12 @@ def on_raiden_event(raiden: RaidenService, event: Event):
         handle_contract_send_secretreveal(raiden, event)
     elif type(event) == ContractSendChannelClose:
         handle_contract_send_channelclose(raiden, event)
-        # handle_contract_send_channelclose2(raiden, event)
     elif type(event) == ContractSendChannelUpdateTransfer:
         handle_contract_send_channelupdate(raiden, event)
-        # handle_contract_send_channelupdate2(raiden, event)
     elif type(event) == ContractSendChannelBatchUnlock:
         handle_contract_send_channelunlock(raiden, event)
     elif type(event) == ContractSendChannelSettle:
         handle_contract_send_channelsettle(raiden, event)
-        # handle_contract_send_channelsettle2(raiden, event)
     elif type(event) in UNEVENTFUL_EVENTS:
         pass
     else:

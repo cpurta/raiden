@@ -1,55 +1,54 @@
-from binascii import unhexlify
-from gevent.lock import RLock
-from gevent.event import AsyncResult
+from collections import defaultdict
 from typing import List, Dict, Optional
-from raiden.utils import typing, compare_versions
 
 import structlog
-from web3.utils.filters import Filter
 from eth_utils import (
     encode_hex,
+    event_abi_to_log_topic,
     is_binary_address,
-    to_normalized_address,
     to_canonical_address,
     to_checksum_address,
+    to_normalized_address,
 )
-from raiden_contracts.contract_manager import CONTRACT_MANAGER
-
-from raiden.blockchain.abi import (
-    CONTRACT_TOKEN_NETWORK,
-    EVENT_CHANNEL_NEW2,
+from gevent.event import AsyncResult
+from gevent.lock import RLock, Semaphore
+from raiden_contracts.constants import (
+    CHANNEL_STATE_CLOSED,
     CHANNEL_STATE_NONEXISTENT,
     CHANNEL_STATE_OPENED,
-    CHANNEL_STATE_CLOSED,
     CHANNEL_STATE_SETTLED,
+    CONTRACT_TOKEN_NETWORK,
+    EVENT_CHANNEL_OPENED,
 )
-from raiden.constants import (
-    NETTINGCHANNEL_SETTLE_TIMEOUT_MIN,
-    NETTINGCHANNEL_SETTLE_TIMEOUT_MAX,
-)
+from raiden_contracts.contract_manager import CONTRACT_MANAGER
+from web3.utils.filters import Filter
+
+from raiden.network.proxies import Token
 from raiden.network.rpc.client import check_address_has_code
-from raiden.network.proxies.token import Token
 from raiden.network.rpc.transactions import (
     check_transaction_threw,
 )
 from raiden.exceptions import (
-    DuplicatedChannelError,
     ChannelIncorrectStateError,
-    InvalidSettleTimeout,
+    ChannelOutdatedError,
+    DuplicatedChannelError,
     SamePeerAddress,
-    ChannelBusyError,
     TransactionThrew,
     InvalidAddress,
     ContractVersionMismatch,
+    InvalidSettleTimeout,
+    DepositMismatch,
 )
 from raiden.settings import (
     EXPECTED_CONTRACTS_VERSION,
 )
 from raiden.utils import (
+    compare_versions,
     pex,
     privatekey_to_address,
-    releasing,
+    typing,
 )
+from raiden.transfer.utils import hash_balance_data
 
 log = structlog.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -63,47 +62,42 @@ class TokenNetwork:
         if not is_binary_address(manager_address):
             raise InvalidAddress('Expected binary address format for token nework')
 
-        check_address_has_code(jsonrpc_client, manager_address, 'Channel Manager')
+        check_address_has_code(jsonrpc_client, manager_address, CONTRACT_TOKEN_NETWORK)
 
         proxy = jsonrpc_client.new_contract_proxy(
             CONTRACT_MANAGER.get_contract_abi(CONTRACT_TOKEN_NETWORK),
             to_normalized_address(manager_address),
         )
 
-        if not compare_versions(
+        is_good_version = compare_versions(
             proxy.contract.functions.contract_version().call(),
             EXPECTED_CONTRACTS_VERSION,
-        ):
+        )
+        if not is_good_version:
             raise ContractVersionMismatch('Incompatible ABI for TokenNetwork')
 
         self.address = manager_address
         self.proxy = proxy
         self.client = jsonrpc_client
         self.node_address = privatekey_to_address(self.client.privkey)
-        # Prevents concurrent deposit, withdraw, close, or settle operations on the same channel
-        self.channel_operations_lock = dict()
         self.open_channel_transactions = dict()
+
+        # Forbids concurrent operations on the same channel
+        self.channel_operations_lock = defaultdict(RLock)
+
+        # Serializes concurent deposits on this token network. This must be an
+        # exclusive lock, since we need to coordinate the approve and
+        # setTotalDeposit calls.
+        self.deposit_lock = Semaphore()
 
     def _call_and_check_result(self, function_name: str, *args):
         fn = getattr(self.proxy.contract.functions, function_name)
         call_result = fn(*args).call()
 
         if call_result == b'':
-            raise RuntimeError(
-                "Call to '{}' returned nothing".format(function_name),
-            )
+            raise RuntimeError(f"Call to '{function_name}' returned nothing")
 
         return call_result
-
-    def _check_channel_lock(self, partner: typing.Address):
-        if partner not in self.channel_operations_lock:
-            self.channel_operations_lock[partner] = RLock()
-
-        if not self.channel_operations_lock[partner].acquire(blocking=False):
-            raise ChannelBusyError(
-                f'Channel between {self.node_address} and {partner} is '
-                f'busy with another ongoing operation.',
-            )
 
     def token_address(self) -> typing.Address:
         """ Return the token of this manager. """
@@ -127,12 +121,14 @@ class TokenNetwork:
             raise InvalidAddress('Expected binary address format for channel partner')
 
         invalid_timeout = (
-            settle_timeout < NETTINGCHANNEL_SETTLE_TIMEOUT_MIN or
-            settle_timeout > NETTINGCHANNEL_SETTLE_TIMEOUT_MAX
+            settle_timeout < self.settlement_timeout_min() or
+            settle_timeout > self.settlement_timeout_max()
         )
         if invalid_timeout:
-            raise InvalidSettleTimeout('settle_timeout must be in range [{}, {}]'.format(
-                NETTINGCHANNEL_SETTLE_TIMEOUT_MIN, NETTINGCHANNEL_SETTLE_TIMEOUT_MAX,
+            raise InvalidSettleTimeout('settle_timeout must be in range [{}, {}], is {}'.format(
+                self.settlement_timeout_min(),
+                self.settlement_timeout_max(),
+                settle_timeout,
             ))
 
         if self.node_address == partner:
@@ -172,7 +168,7 @@ class TokenNetwork:
             'new_netting_channel called',
             peer1=pex(self.node_address),
             peer2=pex(partner),
-            channel_identifier=channel_identifier,
+            channel_identifier=encode_hex(channel_identifier),
         )
 
         return channel_identifier
@@ -191,7 +187,7 @@ class TokenNetwork:
         if not transaction_hash:
             raise RuntimeError('open channel transaction failed')
 
-        self.client.poll(unhexlify(transaction_hash))
+        self.client.poll(transaction_hash)
 
         if check_transaction_threw(self.client, transaction_hash):
             raise DuplicatedChannelError('Duplicated channel')
@@ -290,11 +286,21 @@ class TokenNetwork:
 
         channel_data = self.detail_channel(participant1, participant2)
         participants_data = self.detail_participants(participant1, participant2)
+        chain_id = self.proxy.contract.functions.chain_id().call()
 
         return {
+            'chain_id': chain_id,
             **channel_data,
             **participants_data,
         }
+
+    def settlement_timeout_min(self) -> int:
+        """ Returns the minimal settlement timeout for the token network. """
+        return self.proxy.contract.functions.settlement_timeout_min().call()
+
+    def settlement_timeout_max(self) -> int:
+        """ Returns the maximal settlement timeout for the token network. """
+        return self.proxy.contract.functions.settlement_timeout_max().call()
 
     def locked_amount_by_locksroot(
             self,
@@ -392,7 +398,12 @@ class TokenNetwork:
 
         return self.detail_participant(participant1, participant2)['deposit'] > 0
 
-    def deposit(self, total_deposit: typing.TokenAmount, partner: typing.Address):
+    def set_total_deposit(
+            self,
+            channel_identifier: typing.ChannelID,
+            total_deposit: typing.TokenAmount,
+            partner: typing.Address,
+    ):
         """ Set total token deposit in the channel to total_deposit.
 
         Raises:
@@ -402,74 +413,123 @@ class TokenNetwork:
         if not isinstance(total_deposit, int):
             raise ValueError('total_deposit needs to be an integral number.')
 
-        token_address = self.token_address()
-
-        token = Token(self.client, token_address)
-        current_balance = token.balance_of(self.node_address)
-        current_deposit = self.detail_participant(self.node_address, partner)['deposit']
-        amount_to_deposit = total_deposit - current_deposit
-
-        if amount_to_deposit <= 0:
-            raise ValueError('deposit [{}] must be greater than 0.'.format(
-                amount_to_deposit,
-            ))
-
-        if current_balance < amount_to_deposit:
-            raise ValueError(
-                f'deposit {amount_to_deposit} can not be larger than the '
-                f'available balance {current_balance}, '
-                f'for token at address {pex(token_address)}',
-            )
-
-        log.info(
-            'deposit called',
-            token_network=pex(self.address),
-            node=pex(self.node_address),
-            partner=pex(partner),
-            total_deposit=total_deposit,
-            amount_to_deposit=amount_to_deposit,
+        self._check_for_outdated_channel(
+            self.node_address,
+            partner,
+            channel_identifier,
         )
-        token.approve(self.address, amount_to_deposit)
 
-        self._check_channel_lock(partner)
+        token_address = self.token_address()
+        token = Token(self.client, token_address)
 
-        with releasing(self.channel_operations_lock[partner]):
+        with self.channel_operations_lock[partner], self.deposit_lock:
+            # setTotalDeposit requires a monotonically increasing value. This
+            # is used to handle concurrent actions:
+            #
+            #  - The deposits will be done in order, i.e. the monotonic
+            #  property is preserved by the caller
+            #  - The race of two deposits will be resolved with the larger
+            #  deposit winning
+            #  - Retries wont have effect
+            #
+            # This check is serialized with the channel_operations_lock to avoid
+            # sending invalid transactions on-chain (decreasing total deposit).
+            #
+            current_deposit = self.detail_participant(self.node_address, partner)['deposit']
+            amount_to_deposit = total_deposit - current_deposit
+            if total_deposit < current_deposit:
+                raise DepositMismatch(
+                    f'Current deposit ({current_deposit}) is already larger '
+                    f'than the requested total deposit amount ({total_deposit})',
+                )
+            if amount_to_deposit <= 0:
+                raise ValueError(f'deposit {amount_to_deposit} must be greater than 0.')
+
+            # A node may be setting up multiple channels for the same token
+            # concurrently. Because each deposit changes the user balance this
+            # check must be serialized with the operation locks.
+            #
+            # This check is merely informational, used to avoid sending
+            # transactions which are known to fail.
+            #
+            # It is serialized with the deposit_lock to avoid sending invalid
+            # transactions on-chain (account without balance). The lock
+            # channel_operations_lock is not sufficient, as it allows two
+            # concurrent deposits for different channels.
+            #
+            current_balance = token.balance_of(self.node_address)
+            if current_balance < amount_to_deposit:
+                raise ValueError(
+                    f'deposit {amount_to_deposit} can not be larger than the '
+                    f'available balance {current_balance}, '
+                    f'for token at address {pex(token_address)}',
+                )
+
+            # If there are channels being set up concurrenlty either the
+            # allowance must be accumulated *or* the calls to `approve` and
+            # `setTotalDeposit` must be serialized. This is necessary otherwise
+            # the deposit will fail.
+            #
+            # Calls to approve and setTotalDeposit are serialized with the
+            # deposit_lock to avoid transaction failure, because with two
+            # concurrent deposits, we may have the transactions executed in the
+            # following order
+            #
+            # - approve
+            # - approve
+            # - setTotalDeposit
+            # - setTotalDeposit
+            #
+            # in which case  the second `approve` will overwrite the first,
+            # and the first `setTotalDeposit` will consume the allowance,
+            #  making the second deposit fail.
+            token.approve(self.address, amount_to_deposit)
+
+            log_details = {
+                'token_network': pex(self.address),
+                'node': pex(self.node_address),
+                'partner': pex(partner),
+                'total_deposit': total_deposit,
+                'amount_to_deposit': amount_to_deposit,
+                'id': id(self),
+            }
+            log.info('deposit called', **log_details)
+
             transaction_hash = self.proxy.transact(
                 'setTotalDeposit',
                 self.node_address,
                 total_deposit,
                 partner,
             )
-
-            self.client.poll(unhexlify(transaction_hash))
+            self.client.poll(transaction_hash)
 
             receipt_or_none = check_transaction_threw(self.client, transaction_hash)
-            if receipt_or_none:
-                log.critical(
-                    'deposit failed',
-                    token_network=pex(self.address),
-                    node=pex(self.node_address),
-                    partner=pex(partner),
-                    total_deposit=total_deposit,
-                )
 
-                channel_opened = self.channel_is_opened(partner)
+            if receipt_or_none:
+                if token.allowance(self.node_address, self.address) < amount_to_deposit:
+                    log_msg = (
+                        'deposit failed. The allowance is insufficient, check concurrent deposits '
+                        'for the same token network but different proxies.'
+                    )
+                elif token.balance_of(self.node_address) < amount_to_deposit:
+                    log_msg = 'deposit failed. The address doesnt have funds'
+                else:
+                    log_msg = 'deposit failed'
+
+                log.critical(log_msg, **log_details)
+
+                channel_opened = self.channel_is_opened(self.node_address, partner)
                 if channel_opened is False:
                     raise ChannelIncorrectStateError(
                         'Channel is not in an opened state. A deposit cannot be made',
                     )
                 raise TransactionThrew('Deposit', receipt_or_none)
 
-            log.info(
-                'deposit successful',
-                token_network=pex(self.address),
-                node=pex(self.node_address),
-                partner=pex(partner),
-                total_deposit=total_deposit,
-            )
+            log.info('deposit successful', **log_details)
 
     def close(
             self,
+            channel_identifier: typing.ChannelID,
             partner: typing.Address,
             nonce: typing.Nonce,
             balance_hash: typing.BalanceHash,
@@ -480,22 +540,32 @@ class TokenNetwork:
 
         Raises:
             ChannelBusyError: If the channel is busy with another operation.
+            ChannelIncorrectStateError: If the channel is not in the open state.
         """
 
-        log.info(
-            'close called',
-            token_network=pex(self.address),
-            node=pex(self.node_address),
-            partner=pex(partner),
-            nonce=nonce,
-            balance_hash=encode_hex(balance_hash),
-            additional_hash=encode_hex(additional_hash),
-            signature=encode_hex(signature),
+        log_details = {
+            'token_network': pex(self.address),
+            'node': pex(self.node_address),
+            'partner': pex(partner),
+            'nonce': nonce,
+            'balance_hash': encode_hex(balance_hash),
+            'additional_hash': encode_hex(additional_hash),
+            'signature': encode_hex(signature),
+        }
+        log.info('close called', **log_details)
+
+        self._check_for_outdated_channel(
+            self.node_address,
+            partner,
+            channel_identifier,
         )
 
-        self._check_channel_lock(partner)
+        if not self.channel_is_opened(self.node_address, partner):
+            raise ChannelIncorrectStateError(
+                'Channel is not in an opened state. It cannot be closed.',
+            )
 
-        with releasing(self.channel_operations_lock[partner]):
+        with self.channel_operations_lock[partner]:
             transaction_hash = self.proxy.transact(
                 'closeChannel',
                 partner,
@@ -504,40 +574,22 @@ class TokenNetwork:
                 additional_hash,
                 signature,
             )
-            self.client.poll(unhexlify(transaction_hash))
+            self.client.poll(transaction_hash)
 
             receipt_or_none = check_transaction_threw(self.client, transaction_hash)
             if receipt_or_none:
-                log.critical(
-                    'close failed',
-                    token_network=pex(self.address),
-                    node=pex(self.node_address),
-                    partner=pex(partner),
-                    nonce=nonce,
-                    balance_hash=encode_hex(balance_hash),
-                    additional_hash=encode_hex(additional_hash),
-                    signature=encode_hex(signature),
-                )
-                channel_opened = self.channel_is_opened(self.node_address, partner)
-                if channel_opened is False:
+                log.critical('close failed', **log_details)
+                if not self.channel_is_opened(self.node_address, partner):
                     raise ChannelIncorrectStateError(
                         'Channel is not in an opened state. It cannot be closed.',
                     )
                 raise TransactionThrew('Close', receipt_or_none)
 
-            log.info(
-                'close successful',
-                token_network=pex(self.address),
-                node=pex(self.node_address),
-                partner=pex(partner),
-                nonce=nonce,
-                balance_hash=encode_hex(balance_hash),
-                additional_hash=encode_hex(additional_hash),
-                signature=encode_hex(signature),
-            )
+            log.info('close successful', **log_details)
 
     def update_transfer(
             self,
+            channel_identifier: typing.ChannelID,
             partner: typing.Address,
             nonce: typing.Nonce,
             balance_hash: typing.BalanceHash,
@@ -545,16 +597,22 @@ class TokenNetwork:
             closing_signature: typing.Signature,
             non_closing_signature: typing.Signature,
     ):
-        log.info(
-            'updateNonClosingBalanceProof called',
-            token_network=pex(self.address),
-            node=pex(self.node_address),
-            partner=pex(partner),
-            nonce=nonce,
-            balance_hash=encode_hex(balance_hash),
-            additional_hash=encode_hex(additional_hash),
-            closing_signature=encode_hex(closing_signature),
-            non_closing_signature=encode_hex(non_closing_signature),
+        log_details = {
+            'token_network': pex(self.address),
+            'node': pex(self.node_address),
+            'partner': pex(partner),
+            'nonce': nonce,
+            'balance_hash': encode_hex(balance_hash),
+            'additional_hash': encode_hex(additional_hash),
+            'closing_signature': encode_hex(closing_signature),
+            'non_closing_signature': encode_hex(non_closing_signature),
+        }
+        log.info('updateNonClosingBalanceProof called', **log_details)
+
+        self._check_for_outdated_channel(
+            self.node_address,
+            partner,
+            channel_identifier,
         )
 
         transaction_hash = self.proxy.transact(
@@ -568,56 +626,43 @@ class TokenNetwork:
             non_closing_signature,
         )
 
-        self.client.poll(unhexlify(transaction_hash))
+        self.client.poll(transaction_hash)
 
         receipt_or_none = check_transaction_threw(self.client, transaction_hash)
         if receipt_or_none:
-            log.critical(
-                'updateNonClosingBalanceProof failed',
-                token_network=pex(self.address),
-                node=pex(self.node_address),
-                partner=pex(partner),
-                nonce=nonce,
-                balance_hash=encode_hex(balance_hash),
-                additional_hash=encode_hex(additional_hash),
-                closing_signature=encode_hex(closing_signature),
-                non_closing_signature=encode_hex(non_closing_signature),
-            )
+            log.critical('updateNonClosingBalanceProof failed', **log_details)
             channel_closed = self.channel_is_closed(self.node_address, partner)
             if channel_closed is False:
                 raise ChannelIncorrectStateError('Channel is not in a closed state')
             raise TransactionThrew('Update NonClosing balance proof', receipt_or_none)
 
-        log.info(
-            'updateNonClosingBalanceProof successful',
-            token_network=pex(self.address),
-            node=pex(self.node_address),
-            partner=pex(partner),
-            nonce=nonce,
-            balance_hash=encode_hex(balance_hash),
-            additional_hash=encode_hex(additional_hash),
-            closing_signature=encode_hex(closing_signature),
-            non_closing_signature=encode_hex(non_closing_signature),
-        )
+        log.info('updateNonClosingBalanceProof successful', **log_details)
 
     def withdraw(
             self,
+            channel_identifier: typing.ChannelID,
             partner: typing.Address,
             total_withdraw: int,
             partner_signature: typing.Address,
             signature: typing.Signature,
     ):
-        log.info(
-            'withdraw called',
-            token_network=pex(self.address),
-            node=pex(self.node_address),
-            partner=pex(partner),
-            total_withdraw=total_withdraw,
+        log_details = {
+            'token_network': pex(self.address),
+            'node': pex(self.node_address),
+            'partner': pex(partner),
+            'total_withdraw': total_withdraw,
+            'partner_signature': encode_hex(partner_signature),
+            'signature': encode_hex(signature),
+        }
+        log.info('withdraw called', **log_details)
+
+        self._check_for_outdated_channel(
+            self.node_address,
+            partner,
+            channel_identifier,
         )
 
-        self._check_channel_lock(partner)
-
-        with releasing(self.channel_operations_lock[partner]):
+        with self.channel_operations_lock[partner]:
             transaction_hash = self.proxy.transact(
                 'setTotalWithdraw',
                 self.node_address,
@@ -626,19 +671,11 @@ class TokenNetwork:
                 partner_signature,
                 signature,
             )
-            self.client.poll(unhexlify(transaction_hash))
+            self.client.poll(transaction_hash)
 
             receipt_or_none = check_transaction_threw(self.client, transaction_hash)
             if receipt_or_none:
-                log.critical(
-                    'withdraw failed',
-                    token_network=pex(self.address),
-                    node=pex(self.node_address),
-                    partner=pex(partner),
-                    total_withdraw=total_withdraw,
-                    partner_signature=encode_hex(partner_signature),
-                    signature=encode_hex(signature),
-                )
+                log.critical('withdraw failed', **log_details)
                 channel_opened = self.channel_is_opened(self.node_address, partner)
                 if channel_opened is False:
                     raise ChannelIncorrectStateError(
@@ -646,59 +683,56 @@ class TokenNetwork:
                     )
                 raise TransactionThrew('Withdraw', receipt_or_none)
 
-            log.info(
-                'withdraw successful',
-                token_network=pex(self.address),
-                node=pex(self.node_address),
-                partner=pex(partner),
-                total_withdraw=total_withdraw,
-                partner_signature=encode_hex(partner_signature),
-                signature=encode_hex(signature),
-            )
+            log.info('withdraw successful', **log_details)
 
-    def unlock(self, partner: typing.Address, merkle_tree_leaves: typing.MerkleTreeLeaves):
-        log.info(
-            'unlock called',
-            token_network=pex(self.address),
-            node=pex(self.node_address),
-            partner=pex(partner),
-        )
+    def unlock(
+            self,
+            channel_identifier: typing.ChannelID,
+            partner: typing.Address,
+            merkle_tree_leaves: typing.MerkleTreeLeaves,
+    ):
+        log_details = {
+            'token_network': pex(self.address),
+            'node': pex(self.node_address),
+            'partner': pex(partner),
+            'merkle_tree_leaves': merkle_tree_leaves,
+        }
 
-        # TODO see if we need to do any checks for the unlock_proof
+        if merkle_tree_leaves is None or not merkle_tree_leaves:
+            log.info('skipping unlock, tree is empty', **log_details)
+            return
+
+        log.info('unlock called', **log_details)
+
+        leaves_packed = b''.join(lock.encoded for lock in merkle_tree_leaves)
 
         transaction_hash = self.proxy.transact(
             'unlock',
             self.node_address,
             partner,
-            merkle_tree_leaves,
+            leaves_packed,
         )
 
-        self.client.poll(unhexlify(transaction_hash))
+        self.client.poll(transaction_hash)
         receipt_or_none = check_transaction_threw(self.client, transaction_hash)
 
         if receipt_or_none:
-            log.critical(
-                'unlock failed',
-                token_network=pex(self.address),
-                node=pex(self.node_address),
-                partner=pex(partner),
-            )
             channel_settled = self.channel_is_settled(self.node_address, partner)
+
             if channel_settled is False:
+                log.critical('unlock failed. Channel is not in a settled state', **log_details)
                 raise ChannelIncorrectStateError(
                     'Channel is not in a settled state. An unlock cannot be made',
                 )
+
+            log.critical('unlock failed', **log_details)
             raise TransactionThrew('Unlock', receipt_or_none)
 
-        log.info(
-            'unlock successful',
-            token_network=pex(self.address),
-            node=pex(self.node_address),
-            partner=pex(partner),
-        )
+        log.info('unlock successful', **log_details)
 
     def settle(
             self,
+            channel_identifier: typing.ChannelID,
             transferred_amount: int,
             locked_amount: int,
             locksroot: typing.Locksroot,
@@ -712,26 +746,43 @@ class TokenNetwork:
         Raises:
             ChannelBusyError: If the channel is busy with another operation
         """
-        log.info(
-            'settle called',
-            token_network=pex(self.address),
-            node=pex(self.node_address),
-            partner=pex(partner),
-            transferred_amount=transferred_amount,
-            locked_amount=locked_amount,
-            locksroot=encode_hex(locksroot),
-            partner_transferred_amount=partner_transferred_amount,
-            partner_locked_amount=partner_locked_amount,
-            partner_locksroot=encode_hex(partner_locksroot),
+        log_details = {
+            'token_network': pex(self.address),
+            'node': pex(self.node_address),
+            'partner': pex(partner),
+            'transferred_amount': transferred_amount,
+            'locked_amount': locked_amount,
+            'locksroot': encode_hex(locksroot),
+            'partner_transferred_amount': partner_transferred_amount,
+            'partner_locked_amount': partner_locked_amount,
+            'partner_locksroot': encode_hex(partner_locksroot),
+        }
+        log.info('settle called', **log_details)
+
+        self._check_for_outdated_channel(
+            self.node_address,
+            partner,
+            channel_identifier,
         )
 
-        self._check_channel_lock(partner)
+        with self.channel_operations_lock[partner]:
+            if self._verify_settle_state(
+                transferred_amount,
+                locked_amount,
+                locksroot,
+                partner,
+                partner_transferred_amount,
+                partner_locked_amount,
+                partner_locksroot,
+            ) is False:
+                raise ChannelIncorrectStateError('local state can not be used to call settle')
+            our_maximum = transferred_amount + locked_amount
+            partner_maximum = partner_transferred_amount + partner_locked_amount
 
-        with releasing(self.channel_operations_lock[partner]):
-            # the second participants transferred + locked amount have to be higher than the first
-            if (transferred_amount + locked_amount >
-                    partner_transferred_amount + partner_locked_amount):
+            # The second participant transferred + locked amount must be higher
+            our_bp_is_larger = our_maximum > partner_maximum
 
+            if our_bp_is_larger:
                 transaction_hash = self.proxy.transact(
                     'settleChannel',
                     partner,
@@ -756,40 +807,52 @@ class TokenNetwork:
                     partner_locksroot,
                 )
 
-            self.client.poll(unhexlify(transaction_hash))
+            self.client.poll(transaction_hash)
             receipt_or_none = check_transaction_threw(self.client, transaction_hash)
             if receipt_or_none:
-                log.info(
-                    'settle failed',
-                    token_network=pex(self.address),
-                    node=pex(self.node_address),
-                    partner=pex(partner),
-                    transferred_amount=transferred_amount,
-                    locked_amount=locked_amount,
-                    locksroot=encode_hex(locksroot),
-                    partner_transferred_amount=partner_transferred_amount,
-                    partner_locked_amount=partner_locked_amount,
-                    partner_locksroot=encode_hex(partner_locksroot),
-                )
+                channel_exists = self.channel_exists(self.node_address, partner)
+
+                if not channel_exists:
+                    log.info('settle failed, channel already settled', **log_details)
+                    raise ChannelIncorrectStateError(
+                        'Channel already settled or non-existent',
+                    )
+
                 channel_closed = self.channel_is_closed(self.node_address, partner)
                 if channel_closed is False:
+                    log.info('settle failed, channel is not closed', **log_details)
                     raise ChannelIncorrectStateError(
                         'Channel is not in a closed state. It cannot be settled',
                     )
+
+                log.info('settle failed', **log_details)
                 raise TransactionThrew('Settle', receipt_or_none)
 
-            log.info(
-                'settle successful',
-                token_network=pex(self.address),
-                node=pex(self.node_address),
-                partner=pex(partner),
-                transferred_amount=transferred_amount,
-                locked_amount=locked_amount,
-                locksroot=encode_hex(locksroot),
-                partner_transferred_amount=partner_transferred_amount,
-                partner_locked_amount=partner_locked_amount,
-                partner_locksroot=encode_hex(partner_locksroot),
-            )
+            log.info('settle successful', **log_details)
+
+    def _verify_settle_state(
+        self,
+        transferred_amount: int,
+        locked_amount: int,
+        locksroot: typing.Locksroot,
+        partner: typing.Address,
+        partner_transferred_amount: int,
+        partner_locked_amount: int,
+        partner_locksroot: typing.Locksroot,
+    ):
+        """Check if our local state is up to date with on-chain state."""
+        channel_details = self.detail_participants(self.node_address, partner)
+        our_balance_hash_ok = hash_balance_data(
+            transferred_amount,
+            locked_amount,
+            locksroot,
+        ) == channel_details['our_balance_hash']
+        partner_balance_hash_ok = hash_balance_data(
+            partner_transferred_amount,
+            partner_locked_amount,
+            partner_locksroot,
+        ) == channel_details['partner_balance_hash']
+        return our_balance_hash_ok and partner_balance_hash_ok
 
     def events_filter(
             self,
@@ -827,7 +890,9 @@ class TokenNetwork:
         Return:
             The filter instance.
         """
-        topics = [CONTRACT_MANAGER.get_event_id(EVENT_CHANNEL_NEW2)]
+        event_abi = CONTRACT_MANAGER.get_event_abi(CONTRACT_TOKEN_NETWORK, EVENT_CHANNEL_OPENED)
+        event_id = encode_hex(event_abi_to_log_topic(event_abi))
+        topics = [event_id]
         return self.events_filter(topics, from_block, to_block)
 
     def all_events_filter(
@@ -845,3 +910,29 @@ class TokenNetwork:
             The filter instance.
         """
         return self.events_filter(None, from_block, to_block)
+
+    def _check_for_outdated_channel(
+            self,
+            participant1: typing.Address,
+            participant2: typing.Address,
+            channel_identifier: typing.ChannelID,
+    ):
+        """
+        Checks whether an operation is being execute on a channel
+        between two participants using an old channel identifier
+        """
+        onchain_channel_details = self.detail_channel(
+            participant1,
+            participant2,
+        )
+
+        onchain_channel_identifier = onchain_channel_details.get(
+            'channel_identifier',
+        )
+
+        if onchain_channel_identifier != channel_identifier:
+            raise ChannelOutdatedError(
+                'Current channel identifier is outdated. '
+                f'current={channel_identifier}, '
+                f'new={onchain_channel_identifier}',
+            )

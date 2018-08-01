@@ -10,6 +10,7 @@ from raiden.messages import (
     LockedTransfer,
     Secret,
 )
+from raiden.message_handler import on_message
 from raiden.raiden_service import (
     initiator_init,
     mediator_init,
@@ -29,13 +30,12 @@ from raiden.transfer.state import (
 )
 from raiden.transfer.state_change import ReceiveUnlock
 from raiden.utils import sha3
-from raiden.udp_message_handler import on_udp_message
 
 
 def sign_and_inject(message, key, address, app):
     """Sign the message with key and inject it directly in the app transport layer."""
     message.sign(key)
-    on_udp_message(app.raiden, message)
+    on_message(app.raiden, message)
 
 
 def get_channelstate(app0, app1, token_network_identifier) -> NettingChannelState:
@@ -197,6 +197,7 @@ def claim_lock(app_chain, payment_identifier, token_network_identifier, secret):
         )
 
         secret_message = Secret(
+            unlock_lock.balance_proof.chain_id,
             unlock_lock.message_identifier,
             unlock_lock.payment_identifier,
             unlock_lock.balance_proof.nonce,
@@ -211,9 +212,9 @@ def claim_lock(app_chain, payment_identifier, token_network_identifier, secret):
 
         balance_proof = balanceproof_from_envelope(secret_message)
         receive_unlock = ReceiveUnlock(
-            random.randint(0, UINT64_MAX),
-            unlock_lock.secret,
-            balance_proof,
+            message_identifier=random.randint(0, UINT64_MAX),
+            secret=unlock_lock.secret,
+            balance_proof=balance_proof,
         )
 
         is_valid, _, msg = channel.handle_unlock(

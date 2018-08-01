@@ -1,10 +1,9 @@
-from binascii import unhexlify
-
 from eth_utils import to_canonical_address
+from raiden_contracts.constants import CONTRACT_HUMAN_STANDARD_TOKEN
 from raiden_contracts.contract_manager import CONTRACT_MANAGER
 
 from raiden.network.blockchain_service import BlockChainService
-from raiden.utils import get_contract_path
+from raiden.network.rpc.client import JSONRPCClient
 from raiden.utils import typing
 
 
@@ -26,11 +25,18 @@ def deploy_tokens_and_fund_accounts(
     """
     result = list()
     for _ in range(number_of_tokens):
-        token_address = deploy_service.deploy_contract(
-            contract_name='HumanStandardToken',
-            contract_path=get_contract_path('HumanStandardToken.sol'),
-            constructor_parameters=(token_amount, 'raiden', 2, 'Rd'),
+        token_address = deploy_contract_web3(
+            CONTRACT_HUMAN_STANDARD_TOKEN,
+            deploy_service.client,
+            num_confirmations=None,
+            constructor_arguments=(
+                token_amount,
+                2,
+                'raiden',
+                'Rd',
+            ),
         )
+
         result.append(token_address)
 
         # only the creator of the token starts with a balance (deploy_service),
@@ -46,22 +52,17 @@ def deploy_tokens_and_fund_accounts(
 
 def deploy_contract_web3(
         contract_name: str,
-        deploy_client: BlockChainService,
-        *args,
+        deploy_client: JSONRPCClient,
+        num_confirmations: int = None,
+        constructor_arguments: typing.Tuple[typing.Any, ...] = (),
 ) -> typing.Address:
-    web3 = deploy_client.web3
-
-    contract_interface = CONTRACT_MANAGER.abi[contract_name]
-
-    # Submit the transaction that deploys the contract
-    tx_hash = deploy_client.send_transaction(
-        to=typing.Address(b''),
-        data=contract_interface['bin'],
+    compiled = {
+        contract_name: CONTRACT_MANAGER.get_contract(contract_name),
+    }
+    contract_proxy = deploy_client.deploy_solidity_contract(
+        contract_name,
+        compiled,
+        constructor_parameters=constructor_arguments,
+        confirmations=num_confirmations,
     )
-    tx_hash = unhexlify(tx_hash)
-
-    deploy_client.poll(tx_hash)
-    receipt = web3.eth.getTransactionReceipt(tx_hash)
-
-    contract_address = receipt['contractAddress']
-    return to_canonical_address(contract_address)
+    return typing.Address(to_canonical_address(contract_proxy.contract.address))

@@ -1,10 +1,11 @@
 import sqlite3
-
+import os
 import pytest
 
+from raiden.exceptions import InvalidDBData
 from raiden.transfer.architecture import State, StateManager
 from raiden.storage.serialize import PickleSerializer
-from raiden.storage.sqlite import SQLiteStorage
+from raiden.storage.sqlite import SQLiteStorage, RAIDEN_DB_VERSION
 from raiden.storage.wal import (
     restore_from_latest_snapshot,
     WriteAheadLog,
@@ -14,8 +15,9 @@ from raiden.transfer.architecture import TransitionResult
 from raiden.transfer.events import EventTransferSentFailed
 from raiden.transfer.state_change import (
     Block,
-    ContractReceiveChannelUnlock,
+    ContractReceiveChannelBatchUnlock,
 )
+from raiden.utils import sha3
 
 
 def state_transition_noop(state, state_change):  # pylint: disable=unused-argument
@@ -43,17 +45,41 @@ def new_wal():
     return wal
 
 
+def test_connect_to_corrupt_db(tmpdir):
+    serializer = PickleSerializer
+    dbpath = os.path.join(tmpdir, 'log.db')
+    with open(dbpath, 'wb') as f:
+        f.write(os.urandom(256))
+
+    with pytest.raises(InvalidDBData):
+        SQLiteStorage(dbpath, serializer)
+
+
+def test_wal_has_version():
+    wal = new_wal()
+    assert wal.version == RAIDEN_DB_VERSION
+    # Let's make sure that nobody makes a setter for this attribute
+    with pytest.raises(AttributeError):
+        wal.version = 5
+
+
 def test_write_read_log():
     wal = new_wal()
 
     block_number = 1337
     block = Block(block_number)
-    contract_receive_unlock = ContractReceiveChannelUnlock(
+    unlocked_amount = 10
+    returned_amount = 5
+    participant = factories.make_address()
+    partner = factories.make_address()
+    locksroot = sha3(b'test_write_read_log')
+    contract_receive_unlock = ContractReceiveChannelBatchUnlock(
         factories.make_address(),
-        factories.make_address(),
-        factories.ADDR,
-        factories.UNIT_SECRET,
-        factories.HOP1,
+        participant,
+        partner,
+        locksroot,
+        unlocked_amount,
+        returned_amount,
     )
 
     state_changes1 = wal.storage.get_statechanges_by_identifier(
@@ -83,10 +109,13 @@ def test_write_read_log():
     result1, result2 = state_changes3[-2:]
     assert isinstance(result1, Block)
     assert result1.block_number == block_number
-    assert isinstance(result2, ContractReceiveChannelUnlock)
-    assert result2.channel_identifier == factories.ADDR
-    assert result2.secret == factories.UNIT_SECRET
-    assert result2.receiver == factories.HOP1
+
+    assert isinstance(result2, ContractReceiveChannelBatchUnlock)
+    assert result2.participant == participant
+    assert result2.partner == partner
+    assert result2.locksroot == locksroot
+    assert result2.unlocked_amount == unlocked_amount
+    assert result2.returned_tokens == returned_amount
 
     # Make sure state snapshot can only go for corresponding state change ids
     with pytest.raises(sqlite3.IntegrityError):

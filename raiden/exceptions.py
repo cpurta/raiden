@@ -14,10 +14,6 @@ class HashLengthNot32(RaidenError):
     pass
 
 
-class InvalidFunctionName(RaidenError):
-    """ Raised by the rpc proxy when a call to an unknown function is made. """
-
-
 # Exceptions raised due to user interaction (the user may be another software)
 
 class ChannelNotFound(RaidenError):
@@ -36,14 +32,32 @@ class InsufficientFunds(RaidenError):
     pass
 
 
+class DepositOverLimit(RaidenError):
+    """ Raised when the requested deposit is over the limit
+
+    Used when a *user* tries to deposit a given amount of token in a channel,
+    but the amount is over the testing limit.
+    """
+    pass
+
+
+class DepositMismatch(RaidenError):
+    """ Raised when the requested deposit is lower than actual channel deposit
+
+    Used when a *user* tries to deposit a given amount of token in a channel,
+    but the on-chain amount is already higher.
+    """
+    pass
+
+
 class InvalidAddress(RaidenError):
     """ Raised when the user provided value is not a valid address. """
     pass
 
 
 class InvalidAmount(RaidenError):
-    """ Raised when the user provided value is not an integer and cannot be
-    used to defined a transfer value.
+    """ Raised when the user provided value is not a positive integer and
+    cannot be used to define a transfer value.
     """
     pass
 
@@ -68,6 +82,11 @@ class UnknownAddress(RaidenError):
 
 class UnknownTokenAddress(RaidenError):
     """ Raised when the token address in unknown. """
+    pass
+
+
+class TokenNotRegistered(RaidenError):
+    """ Raised if there is no token network for token used when opening a channel  """
     pass
 
 
@@ -105,17 +124,14 @@ class AddressWithoutCode(RaidenError):
     pass
 
 
-class NoTokenManager(RaidenError):
-    """Manager for a given token does not exist."""
+class AddressWrongContract(RaidenError):
+    """Raised on attempt to execute contract on address that has code but
+    is probably not the contract we wanted."""
+    pass
 
 
 class DuplicatedChannelError(RaidenError):
     """Raised if someone tries to create a channel that already exists."""
-
-
-class ChannelBusyError(RaidenError):
-    """Raised if someone tries to perform an operation on a channel that
-    conflicts with an ongoing operation."""
 
 
 class ChannelIncorrectStateError(RaidenError):
@@ -147,3 +163,26 @@ class APIServerPortInUseError(RaidenError):
 
 class RaidenServicePortInUseError(RaidenError):
     """Raised when Raiden service port is already in use"""
+
+
+class InvalidDBData(RaidenError):
+    """Raised when the data of the WAL are in an unexpected format"""
+
+
+class InvalidBlockNumberInput(RaidenError):
+    """Raised when the user provided a block number that is  < 0 or > UINT64_MAX"""
+
+
+class TransportError(RaidenError):
+    """ Raised when a transport encounters an unexpected error """
+
+
+class ReplacementTransactionUnderpriced(RaidenError):
+    """Raised when a replacement transaction is rejected by the blockchain"""
+
+
+class ChannelOutdatedError(RaidenError):
+    """ Raised when an action is invoked on a channel whose
+    identifier has been replaced with a new channel identifier
+    due to a close/re-open of current channel.
+    """

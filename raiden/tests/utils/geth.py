@@ -40,6 +40,7 @@ GethNodeDescription = namedtuple(
         'private_key',
         'rpc_port',
         'p2p_port',
+        'miner',
     ],
 )
 
@@ -67,7 +68,12 @@ def geth_clique_extradata(extra_vanity, extra_seal):
     )
 
 
-def geth_to_cmd(node: typing.Dict, datadir: str, verbosity: int) -> typing.List[str]:
+def geth_to_cmd(
+        node: typing.Dict,
+        datadir: str,
+        chain_id: int,
+        verbosity: int,
+) -> typing.List[str]:
     """
     Transform a node configuration into a cmd-args list for `subprocess.Popen`.
 
@@ -86,6 +92,7 @@ def geth_to_cmd(node: typing.Dict, datadir: str, verbosity: int) -> typing.List[
         'bootnodes',
         'minerthreads',
         'unlock',
+        'password',
     ]
 
     cmd = ['geth']
@@ -101,11 +108,13 @@ def geth_to_cmd(node: typing.Dict, datadir: str, verbosity: int) -> typing.List[
         '--rpc',
         '--rpcapi', 'eth,net,web3',
         '--rpcaddr', '0.0.0.0',
-        '--networkid', '627',
+        '--networkid', str(chain_id),
         '--verbosity', str(verbosity),
         '--datadir', datadir,
-        '--password', os.path.join(datadir, 'pw'),
     ])
+
+    if node.get('mine', False):
+        cmd.append('--mine')
 
     log.debug('geth command: {}'.format(cmd))
 
@@ -124,10 +133,6 @@ def geth_create_account(datadir: str, privkey: bytes):
     keyfile_path = os.path.join(datadir, 'keyfile')
     with open(keyfile_path, 'wb') as handler:
         handler.write(hexlify(privkey))
-
-    password_path = os.path.join(datadir, 'pw')
-    with open(password_path, 'w') as handler:
-        handler.write(DEFAULT_PASSPHRASE)
 
     create = subprocess.Popen(
         ['geth', '--datadir', datadir, 'account', 'import', keyfile_path],
@@ -242,7 +247,7 @@ def geth_wait_and_check(web3, accounts_addresses, random_marker):
             raise ValueError('account is with a balance of 0')
 
 
-def geth_node_config(miner_pkey, p2p_port, rpc_port, unlock=False):
+def geth_node_config(miner_pkey, p2p_port, rpc_port):
     address = privatekey_to_address(miner_pkey)
     pub = remove_0x_prefix(encode_hex(privtopub(miner_pkey)))
 
@@ -255,9 +260,6 @@ def geth_node_config(miner_pkey, p2p_port, rpc_port, unlock=False):
         'rpcport': rpc_port,
         'enode': f'enode://{pub}@127.0.0.1:{p2p_port}',
     }
-
-    if unlock:
-        config['unlock'] = 0
 
     return config
 
@@ -288,27 +290,54 @@ def geth_prepare_datadir(datadir, genesis_file):
     geth_init_datadir(datadir, node_genesis_path)
 
 
-def geth_run_nodes(
-        geth_nodes,
+def geth_nodes_to_cmds(
         nodes_configuration,
+        geth_nodes,
         base_datadir,
         genesis_file,
+        chain_id,
         verbosity,
-        logdir,
 ):
-    os.makedirs(logdir)
-
     cmds = []
     for config, node in zip(nodes_configuration, geth_nodes):
         datadir = geth_node_to_datadir(config, base_datadir)
         geth_prepare_datadir(datadir, genesis_file)
 
-        if 'unlock' in config:
+        if node.miner:
             geth_create_account(datadir, node.private_key)
 
-        commandline = geth_to_cmd(config, datadir, verbosity)
+        commandline = geth_to_cmd(config, datadir, chain_id, verbosity)
         cmds.append(commandline)
 
+    return cmds
+
+
+def geth_run_nodes(
+        geth_nodes,
+        nodes_configuration,
+        base_datadir,
+        genesis_file,
+        chain_id,
+        verbosity,
+        logdir,
+):
+    os.makedirs(logdir)
+
+    password_path = os.path.join(base_datadir, 'pw')
+    with open(password_path, 'w') as handler:
+        handler.write(DEFAULT_PASSPHRASE)
+
+    cmds = geth_nodes_to_cmds(
+        nodes_configuration,
+        geth_nodes,
+        base_datadir,
+        genesis_file,
+        chain_id,
+        verbosity,
+    )
+
+    stdout = None
+    stderr = None
     processes_list = []
     for pos, cmd in enumerate(cmds):
         log_path = os.path.join(logdir, str(pos))
@@ -317,7 +346,6 @@ def geth_run_nodes(
         stderr = logfile
 
         if '--unlock' in cmd:
-            cmd.append('--mine')
             process = subprocess.Popen(
                 cmd,
                 universal_newlines=True,
@@ -347,6 +375,7 @@ def geth_run_private_blockchain(
         accounts_to_fund: typing.List[bytes],
         geth_nodes: typing.List[GethNodeDescription],
         base_datadir: str,
+        chain_id: int,
         verbosity: str,
         random_marker: str,
 ):
@@ -365,23 +394,25 @@ def geth_run_private_blockchain(
         random_marker: A random marked used to identify the private chain.
     """
     # pylint: disable=too-many-locals,too-many-statements,too-many-arguments,too-many-branches
-    nodes_configuration = []
-    seal_account = None
-    for pos, node in enumerate(geth_nodes):
-        if pos == 0:
-            unlock = True  # make the first node miner
-            seal_account = privatekey_to_address(node.private_key)
 
+    nodes_configuration = []
+    for node in geth_nodes:
         config = geth_node_config(
             node.private_key,
             node.p2p_port,
             node.rpc_port,
-            unlock,
         )
+
+        if node.miner:
+            config['unlock'] = 0
+            config['mine'] = True
+            config['password'] = os.path.join(base_datadir, 'pw')
+
         nodes_configuration.append(config)
 
     geth_node_config_set_bootnodes(nodes_configuration)
 
+    seal_account = privatekey_to_address(geth_nodes[0].private_key)
     genesis_path = os.path.join(base_datadir, 'custom_genesis.json')
     geth_generate_poa_genesis(
         genesis_path,
@@ -401,6 +432,7 @@ def geth_run_private_blockchain(
         nodes_configuration,
         base_datadir,
         genesis_path,
+        chain_id,
         verbosity,
         logdir,
     )
@@ -412,7 +444,7 @@ def geth_run_private_blockchain(
             process.poll()
 
             if process.returncode is not None:
-                raise ValueError('geth failed to start')
+                raise ValueError(f'geth process failed with exit code {process.returncode}')
 
     except (ValueError, RuntimeError) as e:
         # If geth_wait_and_check or the above loop throw an exception make sure

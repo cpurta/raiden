@@ -8,7 +8,7 @@ from raiden.tests.utils.network import (
     create_apps,
     create_network_channels,
     create_sequential_channels,
-    netting_channel_open_and_deposit,
+    payment_channel_open_and_deposit,
     wait_for_channels,
     wait_for_alarm_start,
 )
@@ -18,11 +18,12 @@ log = structlog.get_logger(__name__)  # pylint: disable=invalid-name
 
 @pytest.fixture
 def raiden_chain(
-        request,
         token_addresses,
+        token_network_registry_address,
         channels_per_node,
         deposit,
         settle_timeout,
+        chain_id,
         blockchain_services,
         endpoint_discovery_services,
         raiden_udp_ports,
@@ -47,9 +48,10 @@ def raiden_chain(
     )
 
     raiden_apps = create_apps(
+        chain_id,
         blockchain_services.blockchain_services,
         endpoint_discovery_services,
-        blockchain_services.deploy_registry.address,
+        token_network_registry_address,
         blockchain_services.secret_registry.address,
         raiden_udp_ports,
         reveal_timeout,
@@ -65,26 +67,34 @@ def raiden_chain(
         local_matrix_server,
     )
 
+    start_events = [app.raiden.start_async() for app in raiden_apps]
+    gevent.wait(start_events)
+
+    from_block = 0
     for app in raiden_apps:
-        app.raiden.install_and_query_payment_network_filters(app.raiden.default_registry.address)
+        app.raiden.install_all_blockchain_filters(
+            app.raiden.default_registry,
+            app.raiden.default_secret_registry,
+            from_block,
+        )
 
     app_channels = create_sequential_channels(
         raiden_apps,
         channels_per_node,
     )
 
-    greenlets = []
+    channel_greenlets = []
     for token_address in token_addresses:
         for app_pair in app_channels:
-            greenlets.append(gevent.spawn(
-                netting_channel_open_and_deposit,
+            channel_greenlets.append(gevent.spawn(
+                payment_channel_open_and_deposit,
                 app_pair[0],
                 app_pair[1],
                 token_address,
                 deposit,
                 settle_timeout,
             ))
-    gevent.wait(greenlets)
+    gevent.wait(channel_greenlets)
 
     exception = RuntimeError('`raiden_chain` fixture setup failed, nodes are unreachable')
     with gevent.Timeout(seconds=30, exception=exception):
@@ -102,11 +112,12 @@ def raiden_chain(
 
 @pytest.fixture
 def raiden_network(
-        request,
         token_addresses,
+        token_network_registry_address,
         channels_per_node,
         deposit,
         settle_timeout,
+        chain_id,
         blockchain_services,
         endpoint_discovery_services,
         raiden_udp_ports,
@@ -123,9 +134,10 @@ def raiden_network(
 ):
 
     raiden_apps = create_apps(
+        chain_id,
         blockchain_services.blockchain_services,
         endpoint_discovery_services,
-        blockchain_services.deploy_registry.address,
+        token_network_registry_address,
         blockchain_services.secret_registry.address,
         raiden_udp_ports,
         reveal_timeout,
@@ -141,6 +153,9 @@ def raiden_network(
         local_matrix_server,
     )
 
+    start_events = [app.raiden.start_async() for app in raiden_apps]
+    gevent.wait(start_events)
+
     app_channels = create_network_channels(
         raiden_apps,
         channels_per_node,
@@ -150,7 +165,7 @@ def raiden_network(
     for token_address in token_addresses:
         for app_pair in app_channels:
             greenlets.append(gevent.spawn(
-                netting_channel_open_and_deposit,
+                payment_channel_open_and_deposit,
                 app_pair[0],
                 app_pair[1],
                 token_address,
@@ -173,9 +188,6 @@ def raiden_network(
 
     with gevent.Timeout(seconds=5, exception=exception):
         wait_for_alarm_start(raiden_apps)
-
-    for app in raiden_apps:
-        app.raiden.alarm.poll_for_new_block()
 
     yield raiden_apps
 

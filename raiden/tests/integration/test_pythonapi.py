@@ -1,6 +1,10 @@
 import pytest
 import gevent
 
+from raiden_contracts.constants import (
+    CONTRACT_HUMAN_STANDARD_TOKEN,
+    EVENT_CHANNEL_DEPOSIT,
+)
 from raiden import waiting
 from raiden.api.python import RaidenAPI
 from raiden.exceptions import (
@@ -8,15 +12,15 @@ from raiden.exceptions import (
     InvalidAddress,
     InsufficientFunds,
 )
-from raiden.blockchain.abi import EVENT_CHANNEL_NEW_BALANCE
+from raiden.tests.utils.client import burn_all_eth
 from raiden.tests.utils.events import must_have_event
 from raiden.tests.utils.transfer import (
     assert_synched_channel_state,
     direct_transfer,
     get_channelstate,
 )
+from raiden.tests.utils.smartcontracts import deploy_contract_web3
 from raiden.transfer import views
-from raiden.utils import get_contract_path
 
 # Use a large enough settle timeout to have valid transfer messages
 TEST_TOKEN_SWAP_SETTLE_TIMEOUT = (
@@ -35,10 +39,16 @@ def test_register_token(raiden_network, token_amount):
 
     registry_address = app1.raiden.default_registry.address
 
-    token_address = app1.raiden.chain.deploy_contract(
-        contract_name='HumanStandardToken',
-        contract_path=get_contract_path('HumanStandardToken.sol'),
-        constructor_parameters=(token_amount, 'raiden', 2, 'Rd'),
+    token_address = deploy_contract_web3(
+        CONTRACT_HUMAN_STANDARD_TOKEN,
+        app1.raiden.chain.client,
+        num_confirmations=None,
+        constructor_arguments=(
+            token_amount,
+            2,
+            'raiden',
+            'Rd',
+        ),
     )
 
     api1 = RaidenAPI(app1.raiden)
@@ -49,6 +59,38 @@ def test_register_token(raiden_network, token_amount):
 
     # Exception if we try to reregister
     with pytest.raises(AlreadyRegisteredTokenAddress):
+        api1.token_network_register(registry_address, token_address)
+
+
+@pytest.mark.parametrize('privatekey_seed', ['test_token_registration:{}'])
+@pytest.mark.parametrize('number_of_nodes', [1])
+@pytest.mark.parametrize('channels_per_node', [0])
+@pytest.mark.parametrize('number_of_tokens', [1])
+def test_register_token_insufficient_eth(raiden_network, token_amount):
+    app1 = raiden_network[0]
+
+    registry_address = app1.raiden.default_registry.address
+
+    token_address = deploy_contract_web3(
+        CONTRACT_HUMAN_STANDARD_TOKEN,
+        app1.raiden.chain.client,
+        num_confirmations=None,
+        constructor_arguments=(
+            token_amount,
+            2,
+            'raiden',
+            'Rd',
+        ),
+    )
+
+    api1 = RaidenAPI(app1.raiden)
+    assert token_address not in api1.get_tokens_list(registry_address)
+
+    # app1.raiden loses all its ETH because it has been naughty
+    burn_all_eth(app1.raiden)
+
+    # At this point we should get the InsufficientFunds exception
+    with pytest.raises(InsufficientFunds):
         api1.token_network_register(registry_address, token_address)
 
 
@@ -72,10 +114,16 @@ def test_token_registered_race(raiden_chain, token_amount, retry_timeout):
     event_listeners = app1.raiden.blockchain_events.event_listeners
     app1.raiden.blockchain_events.event_listeners = list()
 
-    token_address = app1.raiden.chain.deploy_contract(
-        contract_name='HumanStandardToken',
-        contract_path=get_contract_path('HumanStandardToken.sol'),
-        constructor_parameters=(token_amount, 'raiden', 2, 'Rd'),
+    token_address = deploy_contract_web3(
+        CONTRACT_HUMAN_STANDARD_TOKEN,
+        app1.raiden.chain.client,
+        num_confirmations=None,
+        constructor_arguments=(
+            token_amount,
+            2,
+            'raiden',
+            'Rd',
+        ),
     )
 
     gevent.sleep(1)
@@ -220,10 +268,13 @@ def test_api_channel_events(raiden_chain, token_addresses):
         identifier=1,
     )
 
-    channel_0_1 = get_channelstate(app0, app1, token_network_identifier)
-    app0_events = RaidenAPI(app0.raiden).get_channel_events(channel_0_1.identifier, 0)
+    app0_events = RaidenAPI(app0.raiden).get_channel_events(
+        token_address,
+        app1.raiden.address,
+        from_block=0,
+    )
 
-    assert must_have_event(app0_events, {'event': EVENT_CHANNEL_NEW_BALANCE})
+    assert must_have_event(app0_events, {'event': EVENT_CHANNEL_DEPOSIT})
 
     # This event was temporarily removed. Confirmation from the transport layer
     # as a state change is necessary to properly fire this event.
@@ -232,14 +283,19 @@ def test_api_channel_events(raiden_chain, token_addresses):
     app0_events = app0.raiden.wal.storage.get_events_by_identifier(0, 'latest')
     max_block = max(event[0] for event in app0_events)
     results = RaidenAPI(app0.raiden).get_channel_events(
-        channel_0_1.identifier,
-        max_block + 1,
-        max_block + 100,
+        token_address,
+        app1.raiden.address,
+        from_block=max_block + 1,
+        to_block=max_block + 100,
     )
     assert not results
 
-    app1_events = RaidenAPI(app1.raiden).get_channel_events(channel_0_1.identifier, 0)
-    assert must_have_event(app1_events, {'event': EVENT_CHANNEL_NEW_BALANCE})
+    app1_events = RaidenAPI(app1.raiden).get_channel_events(
+        token_address,
+        app0.raiden.address,
+        from_block=0,
+    )
+    assert must_have_event(app1_events, {'event': EVENT_CHANNEL_DEPOSIT})
     assert must_have_event(app1_events, {'event': 'EventTransferReceivedSuccess'})
 
 

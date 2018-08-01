@@ -9,31 +9,27 @@ def get_channel_state(
         token_address,
         token_network_address,
         reveal_timeout,
-        netting_channel_proxy,
+        payment_channel_proxy,
+        opened_block_number,
 ):
-    channel_details = netting_channel_proxy.detail()
+    channel_details = payment_channel_proxy.detail()
 
     our_state = NettingChannelEndState(
         channel_details['our_address'],
-        channel_details['our_balance'],
+        channel_details['our_deposit'],
     )
     partner_state = NettingChannelEndState(
         channel_details['partner_address'],
-        channel_details['partner_balance'],
+        channel_details['partner_deposit'],
     )
 
-    identifier = netting_channel_proxy.address
-    settle_timeout = channel_details['settle_timeout']
+    identifier = payment_channel_proxy.channel_identifier
+    settle_timeout = payment_channel_proxy.settle_timeout()
 
-    opened_block_number = netting_channel_proxy.opened()
-    closed_block_number = netting_channel_proxy.closed()
+    closed_block_number = None
 
     # ignore bad open block numbers
     if opened_block_number <= 0:
-        return None
-
-    # ignore negative closed block numbers
-    if closed_block_number < 0:
         return None
 
     open_transaction = TransactionExecutionStatus(
@@ -56,16 +52,17 @@ def get_channel_state(
     settle_transaction = None
 
     channel = NettingChannelState(
-        identifier,
-        token_address,
-        token_network_address,
-        reveal_timeout,
-        settle_timeout,
-        our_state,
-        partner_state,
-        open_transaction,
-        close_transaction,
-        settle_transaction,
+        identifier=identifier,
+        chain_id=channel_details['chain_id'],
+        token_address=token_address,
+        token_network_identifier=token_network_address,
+        reveal_timeout=reveal_timeout,
+        settle_timeout=settle_timeout,
+        our_state=our_state,
+        partner_state=partner_state,
+        open_transaction=open_transaction,
+        close_transaction=close_transaction,
+        settle_transaction=settle_transaction,
     )
 
     return channel

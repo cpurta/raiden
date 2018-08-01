@@ -1,8 +1,8 @@
-from binascii import hexlify, unhexlify
 from typing import Optional
 
 import structlog
 from web3.utils.filters import Filter
+from web3.exceptions import BadFunctionCallOutput
 from eth_utils import (
     is_binary_address,
     to_normalized_address,
@@ -13,15 +13,15 @@ from eth_utils import (
     is_same_address,
 )
 from raiden_contracts.contract_manager import CONTRACT_MANAGER
-
-from raiden.utils import typing, compare_versions
 from raiden_contracts.constants import (
     CONTRACT_TOKEN_NETWORK_REGISTRY,
     EVENT_TOKEN_NETWORK_CREATED,
 )
+
+from raiden.utils import typing, compare_versions
 from raiden.constants import NULL_ADDRESS
 from raiden.exceptions import (
-    NoTokenManager,
+    AddressWrongContract,
     TransactionThrew,
     InvalidAddress,
     ContractVersionMismatch,
@@ -33,7 +33,6 @@ from raiden.utils import (
 from raiden.settings import (
     EXPECTED_CONTRACTS_VERSION,
 )
-from raiden.network.proxies.token_network import TokenNetwork
 from raiden.network.rpc.client import check_address_has_code
 from raiden.network.rpc.transactions import (
     check_transaction_threw,
@@ -58,10 +57,14 @@ class TokenNetworkRegistry:
             to_normalized_address(registry_address),
         )
 
-        if not compare_versions(
-            proxy.contract.functions.contract_version().call(),
-            EXPECTED_CONTRACTS_VERSION,
-        ):
+        try:
+            is_valid_version = compare_versions(
+                proxy.contract.functions.contract_version().call(),
+                EXPECTED_CONTRACTS_VERSION,
+            )
+        except BadFunctionCallOutput:
+            raise AddressWrongContract('')
+        if not is_valid_version:
             raise ContractVersionMismatch('Incompatible ABI for TokenNetworkRegistry')
 
         self.address = registry_address
@@ -69,13 +72,13 @@ class TokenNetworkRegistry:
         self.client = jsonrpc_client
         self.node_address = privatekey_to_address(self.client.privkey)
 
-        self.address_to_tokennetwork = dict()
-        self.token_to_tokennetwork = dict()
-
     def get_token_network(self, token_address: typing.TokenAddress) -> Optional[typing.Address]:
         """ Return the token network address for the given token or None if
         there is no correspoding address.
         """
+        if not isinstance(token_address, typing.T_TargetAddress):
+            raise ValueError('token_address must be an address')
+
         address = self.proxy.contract.functions.token_to_token_networks(
             to_checksum_address(token_address),
         ).call()
@@ -102,7 +105,7 @@ class TokenNetworkRegistry:
             token_address,
         )
 
-        self.client.poll(unhexlify(transaction_hash))
+        self.client.poll(transaction_hash)
         receipt_or_none = check_transaction_threw(self.client, transaction_hash)
         if receipt_or_none:
             log.info(
@@ -123,10 +126,6 @@ class TokenNetworkRegistry:
             )
 
             raise RuntimeError('token_to_token_networks failed')
-        self.token_to_tokennetwork[token_address] = TokenNetwork(
-            self.client,
-            token_network_address,
-        )
 
         log.info(
             'add_token sucessful',
@@ -157,49 +156,18 @@ class TokenNetworkRegistry:
             to_block=to_block,
         )
 
-    def token_network(self, token_network_address: typing.TokenNetworkAddress):
-        """ Return a proxy to interact with a TokenNetwork. """
-        if not is_binary_address(token_network_address):
-            raise InvalidAddress('Expected binary address format for token network')
+    def filter_token_added_events(self):
+        filter_ = self.proxy.contract.events.TokenNetworkCreated.createFilter(fromBlock=0)
+        events = filter_.get_all_entries()
+        if filter_.filter_id:
+            self.proxy.contract.web3.eth.uninstallFilter(filter_.filter_id)
 
-        if token_network_address not in self.address_to_tokennetwork:
-            token_network = TokenNetwork(
-                self.client,
-                token_network_address,
-            )
+        return events
 
-            token_address = token_network.token_address()
+    def settlement_timeout_min(self) -> int:
+        """ Returns the minimal settlement timeout for the token network registry. """
+        return self.proxy.contract.functions.settlement_timeout_min().call()
 
-            self.token_to_tokennetwork[token_address] = token_network
-            self.address_to_tokennetwork[token_network_address] = token_network
-
-        return self.address_to_tokennetwork[token_network_address]
-
-    def tokennetwork_by_token(self, token_address: typing.TokenAddress):
-        """ Find the token network for `token_address` and return a proxy to
-        interact with it.
-
-        If the token is not already registered it raises `EthNodeCommunicationError`,
-        since we try to instantiate a Token Network with an empty address.
-        """
-        if not is_binary_address(token_address):
-            raise InvalidAddress('Expected binary address format for token')
-
-        if token_address not in self.token_to_tokennetwork:
-            check_address_has_code(self.client, token_address)  # check that the token exists
-            token_network_address = self.get_token_network(token_address)
-
-            if token_network_address is None:
-                raise NoTokenManager(
-                    'TokenNetwork for token 0x{} does not exist'.format(hexlify(token_address)),
-                )
-
-            token_network = TokenNetwork(
-                self.client,
-                token_network_address,
-            )
-
-            self.token_to_tokennetwork[token_address] = token_network
-            self.address_to_tokennetwork[token_network_address] = token_network
-
-        return self.token_to_tokennetwork[token_address]
+    def settlement_timeout_max(self) -> int:
+        """ Returns the maximal settlement timeout for the token network registry. """
+        return self.proxy.contract.functions.settlement_timeout_max().call()

@@ -1,7 +1,6 @@
 # pylint: disable=too-many-lines
 import os
 import random
-import sys
 from collections import defaultdict
 
 import filelock
@@ -13,19 +12,12 @@ from eth_utils import is_binary_address
 
 from raiden.network.blockchain_service import BlockChainService
 from raiden.network.proxies import (
-    Registry,
     SecretRegistry,
+    TokenNetworkRegistry,
 )
 from raiden import routing, waiting
 from raiden.blockchain_events_handler import on_blockchain_event
-from raiden.constants import (
-    NETTINGCHANNEL_SETTLE_TIMEOUT_MIN,
-    NETTINGCHANNEL_SETTLE_TIMEOUT_MAX,
-)
-from raiden.blockchain.events import (
-    get_relevant_proxies,
-    BlockchainEvents,
-)
+from raiden.blockchain.events import BlockchainEvents
 from raiden.raiden_event_handler import on_raiden_event
 from raiden.tasks import AlarmTask
 from raiden.transfer import views, node
@@ -36,7 +28,7 @@ from raiden.transfer.mediated_transfer.state import (
 )
 from raiden.transfer.state_change import (
     ActionChangeNodeNetworkState,
-    ActionInitNode,
+    ActionInitChain,
     ActionLeaveAllNetworks,
     ActionTransferDirect,
     Block,
@@ -55,6 +47,7 @@ from raiden.utils import (
     privatekey_to_address,
     random_secret,
     create_default_identifier,
+    typing,
 )
 from raiden.storage import wal, serialize, sqlite
 
@@ -129,29 +122,14 @@ def target_init(transfer: LockedTransfer):
     return init_target_statechange
 
 
-def endpoint_registry_exception_handler(greenlet):
-    try:
-        greenlet.get()
-    except Exception as e:  # pylint: disable=broad-except
-        rpc_unreachable = (
-            e.args[0] == 'timeout when polling for transaction'
-        )
-
-        if rpc_unreachable:
-            log.exception('Endpoint registry failed. Ethereum RPC API might be unreachable.')
-        else:
-            log.exception('Endpoint registry failed.')
-
-        sys.exit(1)
-
-
 class RaidenService:
     """ A Raiden node. """
 
     def __init__(
             self,
             chain: BlockChainService,
-            default_registry: Registry,
+            query_start_block: typing.BlockNumber,
+            default_registry: TokenNetworkRegistry,
             default_secret_registry: SecretRegistry,
             private_key_bin,
             transport,
@@ -161,34 +139,17 @@ class RaidenService:
         if not isinstance(private_key_bin, bytes) or len(private_key_bin) != 32:
             raise ValueError('invalid private_key')
 
-        invalid_timeout = (
-            config['settle_timeout'] < NETTINGCHANNEL_SETTLE_TIMEOUT_MIN or
-            config['settle_timeout'] > NETTINGCHANNEL_SETTLE_TIMEOUT_MAX
-        )
-        if invalid_timeout:
-            raise ValueError('settle_timeout must be in range [{}, {}]'.format(
-                NETTINGCHANNEL_SETTLE_TIMEOUT_MIN, NETTINGCHANNEL_SETTLE_TIMEOUT_MAX,
-            ))
-
-        self.tokens_to_connectionmanagers = dict()
+        self.tokennetworkids_to_connectionmanagers = dict()
         self.identifier_to_results = defaultdict(list)
 
         self.chain: BlockChainService = chain
         self.default_registry = default_registry
+        self.query_start_block = query_start_block
         self.default_secret_registry = default_secret_registry
         self.config = config
         self.privkey = private_key_bin
         self.address = privatekey_to_address(private_key_bin)
         self.discovery = discovery
-
-        if config['transport_type'] == 'udp':
-            endpoint_registration_event = gevent.spawn(
-                discovery.register,
-                self.address,
-                config['external_ip'],
-                config['external_port'],
-            )
-            endpoint_registration_event.link_exception(endpoint_registry_exception_handler)
 
         self.private_key = PrivateKey(private_key_bin)
         self.pubkey = self.private_key.public_key.format(compressed=False)
@@ -219,23 +180,25 @@ class RaidenService:
             self.serialization_file = None
             self.db_lock = None
 
-        if config['transport_type'] == 'udp':
-            # If the endpoint registration fails the node will quit, this must
-            # finish before starting the transport
-            endpoint_registration_event.join()
-
         self.event_poll_lock = gevent.lock.Semaphore()
 
-        self.start()
-
-    def start(self):
-        """ Start the node. """
-        if self.stop_event and self.stop_event.is_set():
-            self.stop_event.clear()
+    def start_async(self) -> Event:
+        """ Start the node asynchronously. """
+        self.start_event.clear()
+        self.stop_event.clear()
 
         if self.database_dir is not None:
             self.db_lock.acquire(timeout=0)
             assert self.db_lock.is_locked
+
+        # start the registration early to speed up the start
+        if self.config['transport_type'] == 'udp':
+            endpoint_registration_greenlet = gevent.spawn(
+                self.discovery.register,
+                self.address,
+                self.config['external_ip'],
+                self.config['external_port'],
+            )
 
         # The database may be :memory:
         storage = sqlite.SQLiteStorage(self.database_path, serialize.PickleSerializer())
@@ -247,9 +210,10 @@ class RaidenService:
         if self.wal.state_manager.current_state is None:
             block_number = self.chain.block_number()
 
-            state_change = ActionInitNode(
+            state_change = ActionInitChain(
                 random.Random(),
                 block_number,
+                self.chain.network_id,
             )
             self.wal.log_and_dispatch(state_change, block_number)
             payment_network = PaymentNetworkState(
@@ -269,22 +233,27 @@ class RaidenService:
             # installed starting from this position without losing events.
             last_log_block_number = views.block_number(self.wal.state_manager.current_state)
 
-        self.install_and_query_payment_network_filters(
-            self.default_registry.address,
+        # Install the filters using the correct from_block value, otherwise
+        # blockchain logs can be lost.
+        self.install_all_blockchain_filters(
+            self.default_registry,
+            self.default_secret_registry,
             last_log_block_number,
         )
 
-        # Regarding the timing of starting the alarm task it is important to:
-        # - Install the filters which will be polled by poll_blockchain_events
-        #   after the state has been primed, otherwise the state changes won't
-        #   have effect.
-        # - Install the filters using the correct from_block value, otherwise
-        #   blockchain logs can be lost.
+        # Complete the first_run of the alarm task and synchronize with the
+        # blockchain since the last run.
+        #
+        # Notes about setup order:
+        # - The filters must be polled after the node state has been primed,
+        # otherwise the state changes won't have effect.
+        # - The alarm must complete its first run  before the transport is started,
+        #  to avoid rejecting messages for unknown channels.
         self.alarm.register_callback(self._callback_new_block)
+        self.alarm.first_run()
+
         self.alarm.start()
 
-        # Start the transport after the registry is queried to avoid warning
-        # about unknown channels.
         queueids_to_queues = views.get_all_messagequeues(views.state_from_raiden(self))
         self.transport.start(self, queueids_to_queues)
 
@@ -294,7 +263,19 @@ class RaidenService:
         for event in unapplied_events:
             on_raiden_event(self, event)
 
-        self.start_event.set()
+        if self.config['transport_type'] == 'udp':
+            def set_start_on_registration(_):
+                self.start_event.set()
+
+            endpoint_registration_greenlet.link(set_start_on_registration)
+        else:
+            self.start_event.set()
+
+        return self.start_event
+
+    def start(self) -> Event:
+        """ Start the node. """
+        self.start_async().wait()
 
     def start_neighbours_healthcheck(self):
         for neighbour in views.all_neighbour_nodes(self.wal.state_manager.current_state):
@@ -347,7 +328,7 @@ class RaidenService:
         event_list = self.wal.log_and_dispatch(state_change, block_number)
 
         for event in event_list:
-            log.debug('EVENT', node=pex(self.address), raiden_event=event)
+            log.debug('RAIDEN EVENT', node=pex(self.address), raiden_event=event)
 
             on_raiden_event(self, event)
 
@@ -360,7 +341,7 @@ class RaidenService:
     def start_health_check_for(self, node_address):
         self.transport.start_health_check(node_address)
 
-    def _callback_new_block(self, current_block_number):
+    def _callback_new_block(self, current_block_number, chain_id):
         """Called once a new block is detected by the alarm task.
 
         Note:
@@ -385,10 +366,10 @@ class RaidenService:
         # expected side-effects are properly applied (introduced by the commit
         # 3686b3275ff7c0b669a6d5e2b34109c3bdf1921d)
         with self.event_poll_lock:
-            for event in self.blockchain_events.poll_blockchain_events():
+            for event in self.blockchain_events.poll_blockchain_events(current_block_number):
                 # These state changes will be procesed with a block_number
-                # which is /larger/ than the NodeState's block_number.
-                on_blockchain_event(self, event, current_block_number)
+                # which is /larger/ than the ChainState's block_number.
+                on_blockchain_event(self, event, current_block_number, chain_id)
 
             # On restart the Raiden node will re-create the filters with the
             # ethereum node. These filters will have the from_block set to the
@@ -410,36 +391,63 @@ class RaidenService:
 
         message.sign(self.private_key)
 
-    def install_and_query_payment_network_filters(self, payment_network_id, from_block=0):
-        proxies = get_relevant_proxies(
-            self.chain,
-            self.address,
-            payment_network_id,
-        )
-
-        # Install the filters and then poll them and dispatch the events to the WAL
+    def install_all_blockchain_filters(
+            self,
+            token_network_registry_proxy,
+            secret_registry_proxy,
+            from_block,
+    ):
         with self.event_poll_lock:
-            self.blockchain_events.add_proxies_listeners(proxies, from_block)
-            for event in self.blockchain_events.poll_blockchain_events():
-                on_blockchain_event(self, event, event.event_data['block_number'])
+            node_state = views.state_from_raiden(self)
+            channels = views.list_all_channelstate(node_state)
+            token_networks = views.get_token_network_identifiers(
+                node_state,
+                token_network_registry_proxy.address,
+            )
 
-    def connection_manager_for_token(self, registry_address, token_address):
-        if not is_binary_address(token_address):
+            self.blockchain_events.add_token_network_registry_listener(
+                token_network_registry_proxy,
+                from_block,
+            )
+            self.blockchain_events.add_secret_registry_listener(
+                secret_registry_proxy,
+                from_block,
+            )
+
+            for token_network in token_networks:
+                token_network_proxy = self.chain.token_network(token_network)
+                self.blockchain_events.add_token_network_listener(
+                    token_network_proxy,
+                    from_block,
+                )
+
+            for channel_state in channels:
+                channel_proxy = self.chain.payment_channel(
+                    channel_state.token_network_identifier,
+                    channel_state.identifier,
+                )
+                self.blockchain_events.add_payment_channel_listener(
+                    channel_proxy,
+                    from_block,
+                )
+
+    def connection_manager_for_token_network(self, token_network_identifier):
+        if not is_binary_address(token_network_identifier):
             raise InvalidAddress('token address is not valid.')
 
-        known_token_networks = views.get_token_network_addresses_for(
-            self.wal.state_manager.current_state,
-            registry_address,
+        known_token_networks = views.get_token_network_identifiers(
+            views.state_from_raiden(self),
+            self.default_registry.address,
         )
 
-        if token_address not in known_token_networks:
+        if token_network_identifier not in known_token_networks:
             raise InvalidAddress('token is not registered.')
 
-        manager = self.tokens_to_connectionmanagers.get(token_address)
+        manager = self.tokennetworkids_to_connectionmanagers.get(token_network_identifier)
 
         if manager is None:
-            manager = ConnectionManager(self, registry_address, token_address)
-            self.tokens_to_connectionmanagers[token_address] = manager
+            manager = ConnectionManager(self, token_network_identifier)
+            self.tokennetworkids_to_connectionmanagers[token_network_identifier] = manager
 
         return manager
 
@@ -452,15 +460,12 @@ class RaidenService:
 
         self.leave_all_token_networks()
 
-        connection_managers = [
-            self.tokens_to_connectionmanagers[token_address]
-            for token_address in self.tokens_to_connectionmanagers
-        ]
+        connection_managers = [cm for cm in self.tokennetworkids_to_connectionmanagers.values()]
 
         if connection_managers:
             waiting.wait_for_settle_all_channels(
                 self,
-                self.alarm.wait_time,
+                self.alarm.sleep_time,
             )
 
     def mediated_transfer_async(
@@ -512,7 +517,7 @@ class RaidenService:
         whereas the mediated transfer requires 6 messages.
         """
 
-        self.transport.start_health_check(target)
+        self.start_health_check_for(target)
 
         if identifier is None:
             identifier = create_default_identifier()
@@ -534,7 +539,7 @@ class RaidenService:
             identifier,
     ):
 
-        self.transport.start_health_check(target)
+        self.start_health_check_for(target)
 
         if identifier is None:
             identifier = create_default_identifier()
@@ -568,5 +573,6 @@ class RaidenService:
         self.handle_state_change(init_mediator_statechange)
 
     def target_mediated_transfer(self, transfer: LockedTransfer):
+        self.start_health_check_for(transfer.initiator)
         init_target_statechange = target_init(transfer)
         self.handle_state_change(init_target_statechange)

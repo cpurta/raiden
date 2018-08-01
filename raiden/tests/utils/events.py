@@ -1,4 +1,4 @@
-from raiden.api.python import RaidenAPI
+from web3.utils.datastructures import AttributeDict
 
 NOVALUE = object()
 
@@ -41,6 +41,14 @@ def must_contain_entry(item_list, type_, data):
     return None
 
 
+def raiden_events_must_contain_entry(raiden, type_, data):
+    return must_contain_entry(
+        [x[1] for x in raiden.wal.storage.get_events_by_identifier(0, 'latest')],
+        type_,
+        data,
+    )
+
+
 def check_dict_nested_attrs(item, dict_data):
     for key, value in dict_data.items():
         if key not in item:
@@ -48,7 +56,7 @@ def check_dict_nested_attrs(item, dict_data):
 
         item_value = item[key]
 
-        if isinstance(item_value, dict):
+        if isinstance(item_value, (AttributeDict, dict)):
             if not check_dict_nested_attrs(item_value, value):
                 return False
         elif item_value != value:
@@ -62,17 +70,3 @@ def must_have_event(event_list, dict_data):
         if isinstance(item, dict) and check_dict_nested_attrs(item, dict_data):
             return item
     return None
-
-
-def get_channel_events_for_token(app, registry_address, token_address, start_block=0):
-    """ Collect all events from all channels for a given `token_address` and `app` """
-    result = list()
-    api = RaidenAPI(app.raiden)
-    channels = api.get_channel_list(
-        registry_address=registry_address,
-        token_address=token_address,
-    )
-    for channel in channels:
-        events = api.get_channel_events(channel.identifier, start_block)
-        result.extend(events)
-    return result

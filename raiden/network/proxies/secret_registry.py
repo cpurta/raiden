@@ -1,6 +1,7 @@
 import structlog
-from binascii import unhexlify
+from typing import List
 
+from web3.exceptions import BadFunctionCallOutput
 from web3.utils.filters import Filter
 from gevent.event import AsyncResult
 from eth_utils import (
@@ -14,7 +15,12 @@ from raiden_contracts.constants import (
     CONTRACT_SECRET_REGISTRY,
     EVENT_SECRET_REVEALED,
 )
-from raiden.exceptions import TransactionThrew, InvalidAddress, ContractVersionMismatch
+from raiden.exceptions import (
+    AddressWrongContract,
+    ContractVersionMismatch,
+    InvalidAddress,
+    TransactionThrew,
+)
 from raiden.network.rpc.client import check_address_has_code
 from raiden.network.rpc.transactions import (
     check_transaction_threw,
@@ -42,18 +48,21 @@ class SecretRegistry:
         if not is_binary_address(secret_registry_address):
             raise InvalidAddress('Expected binary address format for secret registry')
 
-        check_address_has_code(jsonrpc_client, secret_registry_address, 'Registry')
+        check_address_has_code(jsonrpc_client, secret_registry_address, CONTRACT_SECRET_REGISTRY)
 
         proxy = jsonrpc_client.new_contract_proxy(
             CONTRACT_MANAGER.get_contract_abi(CONTRACT_SECRET_REGISTRY),
             to_normalized_address(secret_registry_address),
         )
 
-        if not compare_versions(
-            proxy.contract.functions.contract_version().call(),
-            EXPECTED_CONTRACTS_VERSION,
-        ):
-            raise ContractVersionMismatch('Incompatible ABI for SecretRegistry')
+        try:
+            if not compare_versions(
+                    proxy.contract.functions.contract_version().call(),
+                    EXPECTED_CONTRACTS_VERSION,
+            ):
+                raise ContractVersionMismatch('Incompatible ABI for SecretRegistry')
+        except BadFunctionCallOutput:
+            raise AddressWrongContract('')
 
         self.address = secret_registry_address
         self.proxy = proxy
@@ -62,61 +71,69 @@ class SecretRegistry:
         self.open_secret_transactions = dict()
 
     def register_secret(self, secret: typing.Secret):
-        secrethash = sha3(secret)
-        if self.check_registered(secrethash):
-            log.info(
-                'secret already registered',
-                node=pex(self.node_address),
-                contract=pex(self.address),
-                secrethash=encode_hex(secrethash),
-            )
+        self.register_secret_batch([secret])
+
+    def register_secret_batch(self, secrets: List[typing.Secret]):
+        secret_batch = list()
+        secret_registry_transaction = AsyncResult()
+
+        for secret in secrets:
+            secrethash = sha3(secret)
+            if not self.check_registered(secrethash):
+                if secret not in self.open_secret_transactions:
+                    secret_batch.append(secret)
+                    self.open_secret_transactions[secret] = secret_registry_transaction
+            else:
+                log.info(
+                    'secret already registered',
+                    node=pex(self.node_address),
+                    contract=pex(self.address),
+                    secrethash=encode_hex(secrethash),
+                )
+
+        if not secret_batch:
             return
 
         log.info(
-            'registerSecret called',
+            'registerSecretBatch called',
             node=pex(self.node_address),
             contract=pex(self.address),
         )
 
-        if secret not in self.open_secret_transactions:
-            secret_registry_transaction = AsyncResult()
-            self.open_secret_transactions[secret] = secret_registry_transaction
-            try:
-                transaction_hash = self._register_secret(secret)
-            except Exception as e:
-                secret_registry_transaction.set_exception(e)
-                raise
-            else:
-                secret_registry_transaction.set(transaction_hash)
-            finally:
-                self.open_secret_transactions.pop(secret, None)
+        try:
+            transaction_hash = self._register_secret_batch(secret_batch)
+        except Exception as e:
+            secret_registry_transaction.set_exception(e)
+            raise
         else:
-            transaction_hash = self.open_secret_transactions[secret].get()
+            secret_registry_transaction.set(transaction_hash)
+        finally:
+            for secret in secret_batch:
+                self.open_secret_transactions.pop(secret, None)
 
-    def _register_secret(self, secret: typing.Secret):
-        """Attempts to register a secret on-chain"""
+    def _register_secret_batch(self, secrets):
         transaction_hash = self.proxy.transact(
-            'registerSecret',
-            secret,
+            'registerSecretBatch',
+            secrets,
         )
 
-        self.client.poll(unhexlify(transaction_hash))
+        self.client.poll(transaction_hash)
         receipt_or_none = check_transaction_threw(self.client, transaction_hash)
 
         if receipt_or_none:
             log.critical(
-                'registerSecret failed',
+                'registerSecretBatch failed',
                 node=pex(self.node_address),
                 contract=pex(self.address),
-                secret=secret,
+                secrets=secrets,
             )
-            raise TransactionThrew('registerSecret', receipt_or_none)
+            raise TransactionThrew('registerSecretBatch', receipt_or_none)
 
         log.info(
-            'registerSecret successful',
+            'registerSecretBatch successful',
             node=pex(self.node_address),
             contract=pex(self.address),
-            secret=secret,
+            secrets=secrets,
         )
         return transaction_hash
 

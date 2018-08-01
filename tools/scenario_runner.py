@@ -106,7 +106,7 @@ def run(
         decode_hex(discovery_contract_address),
     )
 
-    registry = blockchain_service.registry(
+    registry = blockchain_service.token_network_registry(
         registry_contract_address,
     )
 
@@ -127,13 +127,15 @@ def run(
     )
 
     app = App(
-        config,
-        blockchain_service,
-        registry,
-        secret_registry,
-        transport,
-        discovery,
+        config=config,
+        chain=blockchain_service,
+        query_start_block=0,
+        default_registry=registry,
+        default_secret_registry=secret_registry,
+        transport=transport,
+        discovery=discovery,
     )
+    app.start()
 
     app.discovery.register(
         app.raiden.address,
@@ -141,7 +143,12 @@ def run(
         listen_port,
     )
 
-    app.raiden.install_and_query_payment_network_filters(app.raiden.default_registry.address)
+    from_block = 0
+    app.raiden.install_all_blockchain_filters(
+        app.raiden.default_registry,
+        app.raiden.default_secret_registry,
+        from_block,
+    )
 
     if scenario:
         script = json.load(scenario)

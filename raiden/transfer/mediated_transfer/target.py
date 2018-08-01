@@ -183,7 +183,7 @@ def handle_secretreveal(
     return iteration
 
 
-def handle_unlock(target_state, state_change, channel_state):
+def handle_unlock(target_state, state_change: ReceiveUnlock, channel_state):
     """ Handles a ReceiveUnlock state change. """
     iteration = TransitionResult(target_state, list())
     balance_proof_sender = state_change.balance_proof.sender
@@ -240,10 +240,7 @@ def handle_block(target_state, channel_state, block_number):
         events = [failed]
 
     elif target_state.state != 'waiting_close':  # only emit the close event once
-        # TODO: to be removed
-        events = events_for_close(target_state, channel_state, block_number)
-
-        events.extend(events_for_onchain_secretreveal(target_state, channel_state, block_number))
+        events = events_for_onchain_secretreveal(target_state, channel_state, block_number)
     else:
         events = list()
 

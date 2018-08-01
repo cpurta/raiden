@@ -1,7 +1,7 @@
+import { Observable, Subscription } from 'rxjs';
+import { map } from 'rxjs/operators';
 import { Component, OnInit, OnDestroy, Input, Output, EventEmitter } from '@angular/core';
 import { FormControl, FormGroup, FormBuilder } from '@angular/forms';
-import { Observable } from 'rxjs/Observable';
-import { Subscription } from 'rxjs/Subscription';
 import { SelectItem } from 'primeng/primeng';
 
 import { RaidenService } from '../../services/raiden.service';
@@ -30,8 +30,9 @@ export class OpenDialogComponent implements OnInit, OnDestroy {
     ) { }
 
     ngOnInit() {
-        this.tokenAddressMapping$ = this.raidenService.getTokens()
-            .map((userTokens) => this.tokenPipe.tokensToSelectItems(userTokens));
+        this.tokenAddressMapping$ = this.raidenService.getTokens().pipe(
+            map((userTokens) => this.tokenPipe.tokensToSelectItems(userTokens)),
+        );
 
         this.form = this.fb.group({
             partner_address: [null, (control) =>
@@ -62,18 +63,18 @@ export class OpenDialogComponent implements OnInit, OnDestroy {
     accept() {
         const value = this.form.value;
         this.raidenService.openChannel(
-            value.partner_address,
             value.token_address,
+            value.partner_address,
+            value.settle_timeout,
             value.balance,
-            value.settle_timeout)
-            .subscribe((response) => {
-                this.sharedService.msg({
-                    severity: 'success',
-                    summary: 'Channel Opened',
-                    detail: `Channel with address ${response.channel_address} has been
-                        created with partner ${response.partner_address}`
-                });
+        ).subscribe((response) => {
+            this.sharedService.msg({
+                severity: 'success',
+                summary: 'Channel Opened',
+                detail: `Channel with identifier ${response.channel_identifier} has been
+                    created with partner ${response.partner_address}`
             });
+        });
         this.visible = false;
     }
 }

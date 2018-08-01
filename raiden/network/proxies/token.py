@@ -1,17 +1,16 @@
-from binascii import unhexlify
-
-from eth_utils import is_binary_address
-
-from raiden.blockchain.abi import (
-    CONTRACT_MANAGER,
-    CONTRACT_HUMAN_STANDARD_TOKEN,
+from eth_utils import (
+    is_binary_address,
+    to_checksum_address,
+    to_normalized_address,
 )
+from raiden_contracts.constants import CONTRACT_HUMAN_STANDARD_TOKEN
+from raiden_contracts.contract_manager import CONTRACT_MANAGER
+
 from raiden.exceptions import TransactionThrew
 from raiden.network.rpc.client import check_address_has_code
 from raiden.network.rpc.transactions import (
     check_transaction_threw,
 )
-from eth_utils import to_checksum_address, to_normalized_address
 from raiden.network.rpc.smartcontract_proxy import ContractProxy
 
 
@@ -25,7 +24,7 @@ class Token:
             CONTRACT_MANAGER.get_contract_abi(CONTRACT_HUMAN_STANDARD_TOKEN),
             to_normalized_address(token_address),
         )
-        self.proxy = ContractProxy(jsonrpc_client, contract)
+        proxy = ContractProxy(jsonrpc_client, contract)
 
         if not is_binary_address(token_address):
             raise ValueError('token_address must be a valid address')
@@ -34,6 +33,13 @@ class Token:
 
         self.address = token_address
         self.client = jsonrpc_client
+        self.proxy = proxy
+
+    def allowance(self, owner, spender):
+        return self.proxy.contract.functions.allowance(
+            to_checksum_address(owner),
+            to_checksum_address(spender),
+        ).call()
 
     def approve(self, contract_address, allowance):
         """ Aprove `contract_address` to transfer up to `deposit` amount of token. """
@@ -42,11 +48,11 @@ class Token:
         # `NettingChannel` and keep this straight forward)
         transaction_hash = self.proxy.transact(
             'approve',
-            contract_address,
+            to_checksum_address(contract_address),
             allowance,
         )
 
-        self.client.poll(unhexlify(transaction_hash))
+        self.client.poll(transaction_hash)
         receipt_or_none = check_transaction_threw(self.client, transaction_hash)
 
         if receipt_or_none:
@@ -99,7 +105,7 @@ class Token:
             amount,
         )
 
-        self.client.poll(unhexlify(transaction_hash))
+        self.client.poll(transaction_hash)
         receipt_or_none = check_transaction_threw(self.client, transaction_hash)
         if receipt_or_none:
             raise TransactionThrew('Transfer', receipt_or_none)

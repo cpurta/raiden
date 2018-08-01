@@ -1,15 +1,20 @@
 import pytest
-from raiden.exceptions import (
-    TransactionThrew,
-    InvalidAddress,
-    AddressWithoutCode,
-    NoTokenManager,
-)
-from raiden.tests.utils.factories import make_address
 from eth_utils import is_same_address, to_canonical_address
+from raiden_contracts.constants import (
+    TEST_SETTLE_TIMEOUT_MIN,
+    TEST_SETTLE_TIMEOUT_MAX,
+)
+
+from raiden.exceptions import TransactionThrew
+from raiden.tests.utils.factories import make_address
+from raiden.network.proxies.token_network_registry import TokenNetworkRegistry
 
 
-def test_network_registry(token_network_registry_proxy, deploy_token):
+def test_network_registry(token_network_registry_proxy: TokenNetworkRegistry, deploy_token):
+
+    assert token_network_registry_proxy.settlement_timeout_min() == TEST_SETTLE_TIMEOUT_MIN
+    assert token_network_registry_proxy.settlement_timeout_max() == TEST_SETTLE_TIMEOUT_MAX
+
     bad_token_address = make_address()
     # try to register non-existing token network
     with pytest.raises(TransactionThrew):
@@ -36,13 +41,9 @@ def test_network_registry(token_network_registry_proxy, deploy_token):
         token_network_address,
     )
 
-    with pytest.raises(AddressWithoutCode):
-        token_network_registry_proxy.tokennetwork_by_token(bad_token_address)
-    with pytest.raises(InvalidAddress):
-        token_network_registry_proxy.tokennetwork_by_token(None)
-    with pytest.raises(NoTokenManager):
-        token_network_registry_proxy.tokennetwork_by_token(token_network_address)
-    token_manager = token_network_registry_proxy.tokennetwork_by_token(
-        test_token_address,
-    )
-    assert token_manager is not None
+    with pytest.raises(ValueError):
+        assert token_network_registry_proxy.get_token_network(None) is None
+
+    assert token_network_registry_proxy.get_token_network(bad_token_address) is None
+    assert token_network_registry_proxy.get_token_network(token_network_address) is None
+    assert token_network_registry_proxy.get_token_network(test_token_address) is not None

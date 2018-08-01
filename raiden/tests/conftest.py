@@ -19,7 +19,7 @@ def pytest_addoption(parser):
     parser.addoption(
         '--blockchain-type',
         choices=['geth', 'tester'],
-        default='tester',
+        default='geth',
     )
 
     parser.addoption(
@@ -67,12 +67,58 @@ def pytest_addoption(parser):
     )
 
 
+@pytest.fixture(scope='session', autouse=True)
+def enable_greenlet_debugger(request):
+    """ Enable the pdb debugger for gevent's greenlets.
+
+    This extends the flag `--pdb` from pytest to enable debugging of greenlets
+    which have raised an exception to the top-level. Without this hook the
+    exception raised in a greenlet is printed, and the thread state is
+    discarded. Making it impossible to execute a post_mortem
+    """
+    if request.config.option.usepdb:
+        import pdb
+        import bdb
+
+        # Do not run pdb again if an exception hits top-level for a second
+        # greenlet and the previous pdb session is still running
+        enabled = False
+        hub = gevent.get_hub()
+
+        def debugger(context, type, value, tb):
+            # Always print the exception, because once the pdb REPL is started
+            # we cannot retrieve it with `sys.exc_info()`.
+            #
+            # Using gevent's hub print_exception because it properly handles
+            # corner cases.
+            hub.print_exception(context, type, value, tb)
+
+            # Don't enter nested sessions
+            # Ignore exceptions used to quit the debugger / interpreter
+            nonlocal enabled
+            if not enabled and type not in (bdb.BdbQuit, KeyboardInterrupt):
+                enabled = True
+                pdb.post_mortem()
+                enabled = False
+
+        # Hooking the debugger on the hub error handler. Exceptions that are
+        # not handled on a given greenlet are forwarded to the
+        # parent.handle_error, until the hub is reached.
+        #
+        # Note: for this to work properly, it's really important to use
+        # gevent's spawn function.
+        hub.handle_error = debugger
+
+
 @pytest.fixture(autouse=True, scope='session')
 def logging_level(request):
     """ Configure the structlog level.
 
     For integration tests this also sets the geth verbosity.
     """
+    # disable pytest's built in log capture, otherwise logs are printed twice
+    request.config.option.showcapture = 'no'
+
     if request.config.option.log_cli_level:
         level = request.config.option.log_cli_level
     elif request.config.option.verbose > 3:
@@ -99,10 +145,10 @@ def logging_level(request):
     )
 
 
-@pytest.fixture(scope='session', autouse=True)
+@pytest.fixture(scope='session', autouse=False)
 def validate_solidity_compiler():
     """ Check the solc prior to running any test. """
-    from raiden.blockchain.abi import validate_solc
+    from raiden.utils.solc import validate_solc
     validate_solc()
 
 

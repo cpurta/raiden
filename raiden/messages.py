@@ -9,7 +9,6 @@ import structlog
 from cachetools import LRUCache, cached
 from operator import attrgetter
 
-from raiden_libs.utils import sign_data
 from raiden.constants import (
     UINT256_MAX,
     UINT64_MAX,
@@ -17,9 +16,9 @@ from raiden.constants import (
 from raiden.encoding import messages, signing
 from raiden.encoding.format import buffer_for
 from raiden.exceptions import InvalidProtocolMessage
-from raiden.transfer.balance_proof import pack_signing_data, pack_signing_data2
+from raiden.transfer.balance_proof import pack_signing_data
 from raiden.transfer.utils import hash_balance_data
-from raiden.transfer.state import EMPTY_MERKLE_ROOT
+from raiden.transfer.state import EMPTY_MERKLE_ROOT, HashTimeLockState
 from raiden.utils import (
     ishash,
     pex,
@@ -36,7 +35,19 @@ from raiden.transfer.mediated_transfer.events import (
     SendRevealSecret,
     SendSecretRequest,
 )
-from raiden.utils.typing import Optional, Address
+from raiden.utils.typing import (
+    Optional,
+    Address,
+    BlockExpiration,
+    ChainID,
+    MessageID,
+    SecretHash,
+    PaymentID,
+    Secret,
+    ChannelID,
+    Locksroot,
+    TokenAmount,
+)
 
 __all__ = (
     'Delivered',
@@ -60,15 +71,21 @@ _hashes_cache = LRUCache(maxsize=128)
 _lock_bytes_cache = LRUCache(maxsize=128)
 
 
-def assert_envelope_values(nonce, channel, transferred_amount, locked_amount, locksroot):
+def assert_envelope_values(
+        nonce: int,
+        channel: ChannelID,
+        transferred_amount: TokenAmount,
+        locked_amount: TokenAmount,
+        locksroot: Locksroot,
+):
     if nonce <= 0:
         raise ValueError('nonce cannot be zero or negative')
 
     if nonce > UINT64_MAX:
         raise ValueError('nonce is too large')
 
-    if len(channel) != 20:
-        raise ValueError('channel is an invalid address')
+    if len(channel) != 32:
+        raise ValueError('channel id is invalid')
 
     if transferred_amount < 0:
         raise ValueError('transferred_amount cannot be negative')
@@ -204,7 +221,7 @@ class SignedMessage(Message):
         super().__init__()
         self.signature = b''
 
-    def data_to_sign(self) -> bytes:
+    def _data_to_sign(self) -> bytes:
         """ Return the binary data to be/which was signed """
         packed = self.packed()
 
@@ -216,7 +233,7 @@ class SignedMessage(Message):
 
     def sign(self, private_key):
         """ Sign message using `private_key`. """
-        message_data = self.data_to_sign()
+        message_data = self._data_to_sign()
         self.signature = signing.sign(message_data, private_key)
 
     @property
@@ -224,7 +241,7 @@ class SignedMessage(Message):
     def sender(self) -> Optional[Address]:
         if not self.signature:
             return None
-        data_that_was_signed = self.data_to_sign()
+        data_that_was_signed = self._data_to_sign()
         message_signature = self.signature
 
         address = signing.recover_address(data_that_was_signed, message_signature)
@@ -243,14 +260,31 @@ class SignedMessage(Message):
 
 
 class EnvelopeMessage(SignedMessage):
-    def __init__(self):
+    def __init__(
+            self,
+            chain_id: ChainID,
+            nonce: None = 0,
+            transferred_amount: TokenAmount = 0,
+            locked_amount: TokenAmount = 0,
+            locksroot: Locksroot = EMPTY_MERKLE_ROOT,
+            channel_identifier: ChannelID = b'',
+            token_network_address: Address = b'',
+    ):
         super().__init__()
-        self.nonce = 0
-        self.transferred_amount = 0
-        self.locked_amount = 0
-        self.locksroot = EMPTY_MERKLE_ROOT
-        self.channel = b''
-        self.token_network_address = b''
+        assert_envelope_values(
+            nonce,
+            channel_identifier,
+            transferred_amount,
+            locked_amount,
+            locksroot,
+        )
+        self.nonce = nonce
+        self.transferred_amount = transferred_amount
+        self.locked_amount = locked_amount
+        self.locksroot = locksroot
+        self.channel = channel_identifier
+        self.token_network_address = token_network_address
+        self.chain_id = chain_id
 
     @property
     def message_hash(self):
@@ -266,43 +300,21 @@ class EnvelopeMessage(SignedMessage):
 
         return message_hash
 
-    def data_to_sign(self):
-        """ Returns an encoded subset of the fields to sign """
-        packed = self.packed()
-        klass = type(packed)
-
-        field = klass.fields_spec[-1]
-        assert field.name == 'signature', 'signature is not the last field'
-
-        data = packed.data
-        return pack_signing_data(
-            klass.get_bytes_from(data, 'nonce'),
-            klass.get_bytes_from(data, 'transferred_amount'),
-            klass.get_bytes_from(data, 'locked_amount'),
-            klass.get_bytes_from(data, 'channel'),
-            klass.get_bytes_from(data, 'locksroot'),
-            self.message_hash,
-        )
-
-    def sign2(self, private_key, chain_id):
-        """ Creates the signature to the balance proof. Will be used in the SC refactoring. """
+    def _data_to_sign(self) -> bytes:
         balance_hash = hash_balance_data(
             self.transferred_amount,
             self.locked_amount,
             self.locksroot,
         )
-        balance_proof_packed = pack_signing_data2(
+        balance_proof_packed = pack_signing_data(
             nonce=self.nonce,
             balance_hash=balance_hash,
-            additional_hash=self.message_hash.decode(),
+            additional_hash=self.message_hash,
             channel_identifier=self.channel,
-            token_network_address=self.token_network_address,
-            chain_id=chain_id,
+            token_network_identifier=self.token_network_address,
+            chain_id=self.chain_id,
         )
-
-        self.signature = encode_hex(
-            sign_data(self.privkey, balance_proof_packed),
-        )
+        return balance_proof_packed
 
 
 class Processed(SignedMessage):
@@ -314,7 +326,7 @@ class Processed(SignedMessage):
     """
     cmdid = messages.PROCESSED
 
-    def __init__(self, message_identifier):
+    def __init__(self, message_identifier: MessageID):
         super().__init__()
         self.message_identifier = message_identifier
 
@@ -363,7 +375,7 @@ class Delivered(SignedMessage):
     """
     cmdid = messages.DELIVERED
 
-    def __init__(self, delivered_message_identifier):
+    def __init__(self, delivered_message_identifier: MessageID):
         super().__init__()
         self.delivered_message_identifier = delivered_message_identifier
 
@@ -406,7 +418,7 @@ class Pong(SignedMessage):
     """ Response to a Ping message. """
     cmdid = messages.PONG
 
-    def __init__(self, nonce):
+    def __init__(self, nonce: int):
         super().__init__()
         self.nonce = nonce
 
@@ -425,7 +437,7 @@ class Ping(SignedMessage):
     """ Healthcheck message. """
     cmdid = messages.PING
 
-    def __init__(self, nonce):
+    def __init__(self, nonce: int):
         super().__init__()
         self.nonce = nonce
 
@@ -444,7 +456,13 @@ class SecretRequest(SignedMessage):
     """ Requests the secret which unlocks a secrethash. """
     cmdid = messages.SECRETREQUEST
 
-    def __init__(self, message_identifier, payment_identifier, secrethash, amount):
+    def __init__(
+            self,
+            message_identifier: MessageID,
+            payment_identifier: PaymentID,
+            secrethash: SecretHash,
+            amount: int,
+    ):
         super().__init__()
         self.message_identifier = message_identifier
         self.payment_identifier = payment_identifier
@@ -522,24 +540,25 @@ class Secret(EnvelopeMessage):
 
     def __init__(
             self,
-            message_identifier,
-            payment_identifier,
-            nonce,
-            token_network_address,
-            channel,
-            transferred_amount,
-            locked_amount,
-            locksroot,
-            secret,
+            chain_id: ChainID,
+            message_identifier: MessageID,
+            payment_identifier: PaymentID,
+            nonce: int,
+            token_network_address: Address,
+            channel_identifier: ChannelID,
+            transferred_amount: TokenAmount,
+            locked_amount: TokenAmount,
+            locksroot: Locksroot,
+            secret: Secret,
     ):
-        super().__init__()
-
-        assert_envelope_values(
-            nonce,
-            channel,
-            transferred_amount,
-            locked_amount,
-            locksroot,
+        super().__init__(
+            chain_id=chain_id,
+            nonce=nonce,
+            transferred_amount=transferred_amount,
+            locked_amount=locked_amount,
+            locksroot=locksroot,
+            channel_identifier=channel_identifier,
+            token_network_address=token_network_address,
         )
 
         if payment_identifier < 0:
@@ -554,21 +573,17 @@ class Secret(EnvelopeMessage):
         self.message_identifier = message_identifier
         self.payment_identifier = payment_identifier
         self.secret = secret
-        self.nonce = nonce
-        self.token_network_address = token_network_address
-        self.channel = channel
-        self.transferred_amount = transferred_amount
-        self.locked_amount = locked_amount
-        self.locksroot = locksroot
 
     def __repr__(self):
         return (
             '<{} ['
-            'msgid:{} paymentid:{} token_network:{} channel:{} nonce:{} transferred_amount:{} '
+            'chainid:{} msgid:{} paymentid:{} token_network:{} channel:{} '
+            'nonce:{} transferred_amount:{} '
             'locked_amount:{} locksroot:{} hash:{} secrethash:{}'
             ']>'
         ).format(
             self.__class__.__name__,
+            self.chain_id,
             self.message_identifier,
             self.payment_identifier,
             pex(self.token_network_address),
@@ -589,11 +604,12 @@ class Secret(EnvelopeMessage):
     @classmethod
     def unpack(cls, packed):
         secret = cls(
+            chain_id=packed.chain_id,
             message_identifier=packed.message_identifier,
             payment_identifier=packed.payment_identifier,
             nonce=packed.nonce,
             token_network_address=packed.token_network_address,
-            channel=packed.channel,
+            channel_identifier=packed.channel,
             transferred_amount=packed.transferred_amount,
             locked_amount=packed.locked_amount,
             locksroot=packed.locksroot,
@@ -603,6 +619,7 @@ class Secret(EnvelopeMessage):
         return secret
 
     def pack(self, packed):
+        packed.chain_id = self.chain_id
         packed.message_identifier = self.message_identifier
         packed.payment_identifier = self.payment_identifier
         packed.nonce = self.nonce
@@ -618,11 +635,12 @@ class Secret(EnvelopeMessage):
     def from_event(cls, event):
         balance_proof = event.balance_proof
         return cls(
+            chain_id=balance_proof.chain_id,
             message_identifier=event.message_identifier,
             payment_identifier=event.payment_identifier,
             nonce=balance_proof.nonce,
             token_network_address=balance_proof.token_network_identifier,
-            channel=balance_proof.channel_address,
+            channel_identifier=balance_proof.channel_address,
             transferred_amount=balance_proof.transferred_amount,
             locked_amount=balance_proof.locked_amount,
             locksroot=balance_proof.locksroot,
@@ -632,12 +650,13 @@ class Secret(EnvelopeMessage):
     def to_dict(self):
         return {
             'type': self.__class__.__name__,
+            'chain_id': self.chain_id,
             'message_identifier': self.message_identifier,
             'payment_identifier': self.payment_identifier,
             'secret': encode_hex(self.secret),
             'nonce': self.nonce,
             'token_network_address': to_normalized_address(self.token_network_address),
-            'channel': to_normalized_address(self.channel),
+            'channel': encode_hex(self.channel),
             'transferred_amount': self.transferred_amount,
             'locked_amount': self.locked_amount,
             'locksroot': encode_hex(self.locksroot),
@@ -648,12 +667,13 @@ class Secret(EnvelopeMessage):
     def from_dict(cls, data):
         assert data['type'] == cls.__name__
         message = cls(
+            chain_id=data['chain_id'],
             message_identifier=data['message_identifier'],
             payment_identifier=data['payment_identifier'],
             secret=decode_hex(data['secret']),
             nonce=data['nonce'],
             token_network_address=to_canonical_address(data['token_network_address']),
-            channel=to_canonical_address(data['channel']),
+            channel_identifier=decode_hex(data['channel']),
             transferred_amount=data['transferred_amount'],
             locked_amount=data['locked_amount'],
             locksroot=decode_hex(data['locksroot']),
@@ -672,7 +692,7 @@ class RevealSecret(SignedMessage):
     """
     cmdid = messages.REVEALSECRET
 
-    def __init__(self, message_identifier, secret):
+    def __init__(self, message_identifier: MessageID, secret: Secret):
         super().__init__()
         self.message_identifier = message_identifier
         self.secret = secret
@@ -759,48 +779,44 @@ class DirectTransfer(EnvelopeMessage):
 
     def __init__(
             self,
-            message_identifier,
-            payment_identifier,
-            nonce,
-            token_network_address,
-            token,
-            channel,
-            transferred_amount,
-            locked_amount,
-            recipient,
-            locksroot,
+            chain_id: ChainID,
+            message_identifier: MessageID,
+            payment_identifier: PaymentID,
+            nonce: int,
+            token_network_address: Address,
+            token: Address,
+            channel_identifier: ChannelID,
+            transferred_amount: TokenAmount,
+            locked_amount: TokenAmount,
+            recipient: Address,
+            locksroot: Locksroot,
     ):
 
-        assert_envelope_values(
-            nonce,
-            channel,
-            transferred_amount,
-            locked_amount,
-            locksroot,
+        super().__init__(
+            chain_id=chain_id,
+            nonce=nonce,
+            transferred_amount=transferred_amount,
+            locked_amount=locked_amount,
+            locksroot=locksroot,
+            channel_identifier=channel_identifier,
+            token_network_address=token_network_address,
         )
         assert_transfer_values(payment_identifier, token, recipient)
-
-        super().__init__()
         self.message_identifier = message_identifier
         self.payment_identifier = payment_identifier
-        self.nonce = nonce
-        self.token_network_address = token_network_address
         self.token = token
-        self.channel = channel
-        self.transferred_amount = transferred_amount  #: total amount of token sent to partner
-        self.locked_amount = locked_amount  #: total amount of token locked in the merkle tree
         self.recipient = recipient  #: partner's address
-        self.locksroot = locksroot  #: the merkle root that represent all pending locked transfers
 
     @classmethod
     def unpack(cls, packed):
         transfer = cls(
+            chain_id=packed.chain_id,
             message_identifier=packed.message_identifier,
             payment_identifier=packed.payment_identifier,
             nonce=packed.nonce,
             token_network_address=packed.token_network_address,
             token=packed.token,
-            channel=packed.channel,
+            channel_identifier=packed.channel,
             transferred_amount=packed.transferred_amount,
             recipient=packed.recipient,
             locked_amount=packed.locked_amount,
@@ -811,6 +827,7 @@ class DirectTransfer(EnvelopeMessage):
         return transfer
 
     def pack(self, packed):
+        packed.chain_id = self.chain_id
         packed.message_identifier = self.message_identifier
         packed.payment_identifier = self.payment_identifier
         packed.nonce = self.nonce
@@ -828,12 +845,13 @@ class DirectTransfer(EnvelopeMessage):
         balance_proof = event.balance_proof
 
         return cls(
+            chain_id=balance_proof.chain_id,
             message_identifier=event.message_identifier,
             payment_identifier=event.payment_identifier,
             nonce=balance_proof.nonce,
             token_network_address=balance_proof.token_network_identifier,
             token=event.token,
-            channel=balance_proof.channel_address,
+            channel_identifier=balance_proof.channel_address,
             transferred_amount=balance_proof.transferred_amount,
             locked_amount=balance_proof.locked_amount,
             recipient=event.recipient,
@@ -843,11 +861,12 @@ class DirectTransfer(EnvelopeMessage):
     def __repr__(self):
         representation = (
             '<{} ['
-            'msgid:{} paymentid:{} token_network:{} channel:{} nonce:{} transferred_amount:{} '
-            'locked_amount:{} locksroot:{} hash:{}'
+            'chainid:{} msgid:{} paymentid:{} token_network:{} channel:{} nonce:{} '
+            'transferred_amount:{} locked_amount:{} locksroot:{} hash:{}'
             ']>'
         ).format(
             self.__class__.__name__,
+            self.chain_id,
             self.message_identifier,
             self.payment_identifier,
             pex(self.token_network_address),
@@ -864,12 +883,13 @@ class DirectTransfer(EnvelopeMessage):
     def to_dict(self):
         return {
             'type': self.__class__.__name__,
+            'chain_id': self.chain_id,
             'message_identifier': self.message_identifier,
             'payment_identifier': self.payment_identifier,
             'nonce': self.nonce,
             'token_network_address': to_normalized_address(self.token_network_address),
             'token': to_normalized_address(self.token),
-            'channel': to_normalized_address(self.channel),
+            'channel': encode_hex(self.channel),
             'transferred_amount': self.transferred_amount,
             'locked_amount': self.locked_amount,
             'recipient': to_normalized_address(self.recipient),
@@ -881,12 +901,13 @@ class DirectTransfer(EnvelopeMessage):
     def from_dict(cls, data):
         assert data['type'] == cls.__name__
         direct_transfer = cls(
+            chain_id=data['chain_id'],
             message_identifier=data['message_identifier'],
             payment_identifier=data['payment_identifier'],
             nonce=data['nonce'],
             token_network_address=to_canonical_address(data['token_network_address']),
             token=to_canonical_address(data['token']),
-            channel=to_canonical_address(data['channel']),
+            channel_identifier=decode_hex(data['channel']),
             transferred_amount=data['transferred_amount'],
             recipient=to_canonical_address(data['recipient']),
             locked_amount=data['locked_amount'],
@@ -908,7 +929,7 @@ class Lock:
     # Lock is not a message, it is a serializable structure that is reused in
     # some messages
 
-    def __init__(self, amount, expiration, secrethash):
+    def __init__(self, amount: TokenAmount, expiration: BlockExpiration, secrethash: SecretHash):
         # guarantee that `amount` can be serialized using the available bytes
         # in the fixed length format
         if amount < 0:
@@ -954,16 +975,6 @@ class Lock:
             secrethash=packed.secrethash,
         )
 
-    @classmethod
-    def from_state(cls, state):
-        lock = cls(
-            amount=state.amount,
-            expiration=state.expiration,
-            secrethash=state.secrethash,
-        )
-
-        return lock
-
     def __eq__(self, other):
         if isinstance(other, Lock):
             return self.as_bytes == other.as_bytes
@@ -1006,41 +1017,37 @@ class LockedTransferBase(EnvelopeMessage):
     [nonce, token, balance, recipient, locksroot, ...] along a merkle proof
     from locksroot to the not yet netted formerly locked amount.
     """
+
     def __init__(
             self,
-            message_identifier,
-            payment_identifier,
-            nonce,
-            token_network_address,
-            token,
-            channel,
-            transferred_amount,
-            locked_amount,
-            recipient,
-            locksroot,
-            lock):
-        super().__init__()
-
-        assert_envelope_values(
-            nonce,
-            channel,
-            transferred_amount,
-            locked_amount,
-            locksroot,
+            chain_id: ChainID,
+            message_identifier: MessageID,
+            payment_identifier: PaymentID,
+            nonce: int,
+            token_network_address: Address,
+            token: Address,
+            channel_identifier: ChannelID,
+            transferred_amount: TokenAmount,
+            locked_amount: TokenAmount,
+            recipient: Address,
+            locksroot: Locksroot,
+            lock: HashTimeLockState,
+    ):
+        super().__init__(
+            chain_id=chain_id,
+            nonce=nonce,
+            transferred_amount=transferred_amount,
+            locked_amount=locked_amount,
+            locksroot=locksroot,
+            channel_identifier=channel_identifier,
+            token_network_address=token_network_address,
         )
-
         assert_transfer_values(payment_identifier, token, recipient)
 
         self.message_identifier = message_identifier
         self.payment_identifier = payment_identifier
-        self.nonce = nonce
-        self.token_network_address = token_network_address
         self.token = token
-        self.channel = channel
-        self.transferred_amount = transferred_amount
-        self.locked_amount = locked_amount
         self.recipient = recipient
-        self.locksroot = locksroot
         self.lock = lock
 
     @classmethod
@@ -1052,12 +1059,13 @@ class LockedTransferBase(EnvelopeMessage):
         )
 
         locked_transfer = cls(
+            chain_id=packed.chain_id,
             message_identifier=packed.message_identifier,
             payment_identifier=packed.payment_identifier,
             nonce=packed.nonce,
             token_network_address=packed.token_network_address,
             token=packed.token,
-            channel=packed.channel,
+            channel_identifier=packed.channel,
             transferred_amount=packed.transferred_amount,
             recipient=packed.recipient,
             locked_amount=packed.locked_amount,
@@ -1068,6 +1076,7 @@ class LockedTransferBase(EnvelopeMessage):
         return locked_transfer
 
     def pack(self, packed):
+        packed.chain_id = self.chain_id
         packed.message_identifier = self.message_identifier
         packed.payment_identifier = self.payment_identifier
         packed.nonce = self.nonce
@@ -1111,20 +1120,22 @@ class LockedTransfer(LockedTransferBase):
 
     def __init__(
             self,
-            message_identifier,
-            payment_identifier,
-            nonce,
-            token_network_address,
-            token,
-            channel,
-            transferred_amount,
-            locked_amount,
-            recipient,
-            locksroot,
-            lock,
-            target,
-            initiator,
-            fee=0):
+            chain_id: ChainID,
+            message_identifier: MessageID,
+            payment_identifier: PaymentID,
+            nonce: int,
+            token_network_address: Address,
+            token: Address,
+            channel_identifier: ChannelID,
+            transferred_amount: TokenAmount,
+            locked_amount: TokenAmount,
+            recipient: Address,
+            locksroot: Locksroot,
+            lock: HashTimeLockState,
+            target: Address,
+            initiator: Address,
+            fee: int = 0,
+    ):
 
         if len(target) != 20:
             raise ValueError('target is an invalid address')
@@ -1136,12 +1147,13 @@ class LockedTransfer(LockedTransferBase):
             raise ValueError('fee is too large')
 
         super().__init__(
+            chain_id,
             message_identifier,
             payment_identifier,
             nonce,
             token_network_address,
             token,
-            channel,
+            channel_identifier,
             transferred_amount,
             locked_amount,
             recipient,
@@ -1156,11 +1168,13 @@ class LockedTransfer(LockedTransferBase):
     def __repr__(self):
         representation = (
             '<{} ['
-            'msgid:{} paymentid:{} token_network:{} channel:{} nonce:{} transferred_amount:{} '
+            'chainid:{} msgid:{} paymentid:{} token_network:{} channel:{} '
+            'nonce:{} transferred_amount:{} '
             'locked_amount:{} locksroot:{} hash:{} secrethash:{} expiration:{} amount:{}'
             ']>'
         ).format(
             self.__class__.__name__,
+            self.chain_id,
             self.message_identifier,
             self.payment_identifier,
             pex(self.token_network_address),
@@ -1186,12 +1200,13 @@ class LockedTransfer(LockedTransferBase):
         )
 
         mediated_transfer = cls(
+            chain_id=packed.chain_id,
             message_identifier=packed.message_identifier,
             payment_identifier=packed.payment_identifier,
             nonce=packed.nonce,
             token_network_address=packed.token_network_address,
             token=packed.token,
-            channel=packed.channel,
+            channel_identifier=packed.channel,
             transferred_amount=packed.transferred_amount,
             locked_amount=packed.locked_amount,
             recipient=packed.recipient,
@@ -1205,6 +1220,7 @@ class LockedTransfer(LockedTransferBase):
         return mediated_transfer
 
     def pack(self, packed):
+        packed.chain_id = self.chain_id
         packed.message_identifier = self.message_identifier
         packed.payment_identifier = self.payment_identifier
         packed.nonce = self.nonce
@@ -1239,12 +1255,13 @@ class LockedTransfer(LockedTransferBase):
         fee = 0
 
         return cls(
+            chain_id=balance_proof.chain_id,
             message_identifier=event.message_identifier,
             payment_identifier=transfer.payment_identifier,
             nonce=balance_proof.nonce,
             token_network_address=balance_proof.token_network_identifier,
             token=transfer.token,
-            channel=balance_proof.channel_address,
+            channel_identifier=balance_proof.channel_address,
             transferred_amount=balance_proof.transferred_amount,
             locked_amount=balance_proof.locked_amount,
             recipient=event.recipient,
@@ -1258,12 +1275,13 @@ class LockedTransfer(LockedTransferBase):
     def to_dict(self):
         return {
             'type': self.__class__.__name__,
+            'chain_id': self.chain_id,
             'message_identifier': self.message_identifier,
             'payment_identifier': self.payment_identifier,
             'nonce': self.nonce,
             'token_network_address': to_normalized_address(self.token_network_address),
             'token': to_normalized_address(self.token),
-            'channel': to_normalized_address(self.channel),
+            'channel': encode_hex(self.channel),
             'transferred_amount': self.transferred_amount,
             'locked_amount': self.locked_amount,
             'recipient': to_normalized_address(self.recipient),
@@ -1278,12 +1296,13 @@ class LockedTransfer(LockedTransferBase):
     @classmethod
     def from_dict(cls, data):
         message = cls(
+            chain_id=data['chain_id'],
             message_identifier=data['message_identifier'],
             payment_identifier=data['payment_identifier'],
             nonce=data['nonce'],
             token_network_address=to_canonical_address(data['token_network_address']),
             token=to_canonical_address(data['token']),
-            channel=to_canonical_address(data['channel']),
+            channel_identifier=decode_hex(data['channel']),
             transferred_amount=data['transferred_amount'],
             locked_amount=data['locked_amount'],
             recipient=to_canonical_address(data['recipient']),
@@ -1313,12 +1332,13 @@ class RefundTransfer(LockedTransfer):
         )
 
         locked_transfer = cls(
+            chain_id=packed.chain_id,
             message_identifier=packed.message_identifier,
             payment_identifier=packed.payment_identifier,
             nonce=packed.nonce,
             token_network_address=packed.token_network_address,
             token=packed.token,
-            channel=packed.channel,
+            channel_identifier=packed.channel,
             transferred_amount=packed.transferred_amount,
             locked_amount=packed.locked_amount,
             recipient=packed.recipient,
@@ -1342,12 +1362,13 @@ class RefundTransfer(LockedTransfer):
         fee = 0
 
         return cls(
+            chain_id=balance_proof.chain_id,
             message_identifier=event.message_identifier,
             payment_identifier=event.payment_identifier,
             nonce=balance_proof.nonce,
             token_network_address=balance_proof.token_network_identifier,
             token=event.token,
-            channel=balance_proof.channel_address,
+            channel_identifier=balance_proof.channel_address,
             transferred_amount=balance_proof.transferred_amount,
             locked_amount=balance_proof.locked_amount,
             recipient=event.recipient,
@@ -1361,12 +1382,13 @@ class RefundTransfer(LockedTransfer):
     def to_dict(self):
         return {
             'type': self.__class__.__name__,
+            'chain_id': self.chain_id,
             'message_identifier': self.message_identifier,
             'payment_identifier': self.payment_identifier,
             'nonce': self.nonce,
             'token_network_address': to_normalized_address(self.token_network_address),
             'token': to_normalized_address(self.token),
-            'channel': to_normalized_address(self.channel),
+            'channel': encode_hex(self.channel),
             'transferred_amount': self.transferred_amount,
             'locked_amount': self.locked_amount,
             'recipient': to_normalized_address(self.recipient),
@@ -1381,12 +1403,13 @@ class RefundTransfer(LockedTransfer):
     @classmethod
     def from_dict(cls, data):
         message = cls(
+            chain_id=data['chain_id'],
             message_identifier=data['message_identifier'],
             payment_identifier=data['payment_identifier'],
             nonce=data['nonce'],
             token_network_address=to_canonical_address(data['token_network_address']),
             token=to_canonical_address(data['token']),
-            channel=to_canonical_address(data['channel']),
+            channel_identifier=decode_hex(data['channel']),
             transferred_amount=data['transferred_amount'],
             locked_amount=data['locked_amount'],
             recipient=to_canonical_address(data['recipient']),

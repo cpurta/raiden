@@ -9,6 +9,7 @@ from raiden.transfer import channel, views
 from raiden.transfer.state import EMPTY_MERKLE_ROOT
 from raiden.tests.utils.geth import wait_until_block
 from raiden.tests.utils.factories import (
+    UNIT_CHAIN_ID,
     UNIT_SECRETHASH,
     make_address,
     make_privkey_address,
@@ -31,10 +32,10 @@ def test_failsfast_directtransfer_exceeding_distributable(
 
     alice_app, bob_app = raiden_network
     token_address = token_addresses[0]
-    node_state = views.state_from_app(alice_app)
+    chain_state = views.state_from_app(alice_app)
     payment_network_id = alice_app.raiden.default_registry.address
     token_network_identifier = views.get_token_network_identifier_by_token_address(
-        node_state,
+        chain_state,
         payment_network_id,
         token_address,
     )
@@ -67,12 +68,13 @@ def test_receive_directtransfer_invalidtoken(raiden_network, deposit, token_addr
     invalid_token_address = make_address()
     channel_identifier = channel0.identifier
     direct_transfer_message = DirectTransfer(
+        chain_id=UNIT_CHAIN_ID,
         message_identifier=message_identifier,
         payment_identifier=payment_identifier,
         nonce=1,
         token_network_address=token_network_identifier,
         token=invalid_token_address,
-        channel=channel_identifier,
+        channel_identifier=channel_identifier,
         transferred_amount=0,
         locked_amount=0,
         recipient=app1.raiden.address,
@@ -114,12 +116,13 @@ def test_receive_directtransfer_invalidlocksroot(raiden_network, token_addresses
     message_identifier = random.randint(0, UINT64_MAX)
 
     direct_transfer_message = DirectTransfer(
+        chain_id=UNIT_CHAIN_ID,
         message_identifier=message_identifier,
         payment_identifier=payment_identifier,
         nonce=1,
         token_network_address=token_network_identifier,
         token=token_address,
-        channel=channel_identifier,
+        channel_identifier=channel_identifier,
         transferred_amount=0,
         locked_amount=0,
         recipient=app1.raiden.address,
@@ -157,12 +160,13 @@ def test_receive_directtransfer_invalidsender(raiden_network, deposit, token_add
     message_identifier = random.randint(0, UINT64_MAX)
 
     direct_transfer_message = DirectTransfer(
+        chain_id=UNIT_CHAIN_ID,
         message_identifier=message_identifier,
         payment_identifier=1,
         nonce=1,
         token_network_address=token_network_identifier,
         token=token_address,
-        channel=channel_identifier,
+        channel_identifier=channel_identifier,
         transferred_amount=10,
         locked_amount=0,
         recipient=app0.raiden.address,
@@ -220,12 +224,13 @@ def test_receive_directtransfer_invalidnonce(raiden_network, deposit, token_addr
     message_identifier = random.randint(0, UINT64_MAX)
 
     invalid_direct_transfer_message = DirectTransfer(
+        chain_id=UNIT_CHAIN_ID,
         message_identifier=message_identifier,
         payment_identifier=same_payment_identifier,
         nonce=1,
         token_network_address=token_network_identifier,
         token=token_address,
-        channel=channel0.identifier,
+        channel_identifier=channel0.identifier,
         transferred_amount=invalid_transferred_amount,
         locked_amount=0,
         recipient=app1.raiden.address,
@@ -274,12 +279,13 @@ def test_received_directtransfer_closedchannel(raiden_network, token_addresses, 
     # Now receive one direct transfer for the closed channel
     message_identifier = random.randint(0, UINT64_MAX)
     direct_transfer_message = DirectTransfer(
+        chain_id=UNIT_CHAIN_ID,
         message_identifier=message_identifier,
         payment_identifier=1,
         nonce=1,
         token_network_address=token_network_identifier,
         token=token_address,
-        channel=channel0.identifier,
+        channel_identifier=channel0.identifier,
         transferred_amount=10,
         locked_amount=0,
         recipient=app0.raiden.address,

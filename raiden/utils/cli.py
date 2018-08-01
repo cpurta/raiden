@@ -1,15 +1,25 @@
+import errno
+import os
 import re
+import sys
 from ipaddress import IPv4Address, AddressValueError
 from itertools import groupby
-from typing import Callable, List
+from pathlib import Path
+from string import Template
+from typing import Callable, List, Union, Any, Dict
 
 import click
+import pytoml
 from click._compat import term_len
 from click.formatting import iter_rows, measure_table, wrap_text
+from pytoml import TomlError
 
 from raiden.utils import address_checksum_and_decode
 from raiden.constants import NETWORKNAME_TO_ID
 from raiden.exceptions import InvalidAddress
+
+
+LOG_CONFIG_OPTION_NAME = 'log_config'
 
 
 class HelpFormatter(click.HelpFormatter):
@@ -264,6 +274,113 @@ class MatrixServerType(click.Choice):
         if value.startswith('http'):
             return value
         return super().convert(value, param, ctx)
+
+
+class HypenTemplate(Template):
+    idpattern = r'(?-i:[_a-zA-Z-][_a-zA-Z0-9-]*)'
+
+
+class PathRelativePath(click.Path):
+    """
+    `click.Path` subclass that can default to a value depending on
+    another option of type `click.Path`.
+
+    Uses :ref:`string.Template` to expand the parameters default value.
+
+    Example::
+
+        @click.option('--some-dir', type=click.Path())
+        @click.option('--some-file', type=PathRelativePath(), default='${some-dir}/file.txt')
+    """
+
+    def convert(self, value, param, ctx):
+        if value == param.default:
+            try:
+                value = self.expand_default(value, ctx.params)
+            except KeyError as ex:
+                raise RuntimeError(
+                    'Subsitution parameter not found in context. '
+                    'Make sure it\'s defined with `is_eager=True`.'  # noqa: C812
+                ) from ex
+
+        return super().convert(value, param, ctx)
+
+    @staticmethod
+    def expand_default(default, params):
+        return HypenTemplate(default).substitute(params)
+
+
+def apply_config_file(
+    command_function: Union[click.Command, click.Group],
+    cli_params: Dict[str, Any],
+    ctx,
+    config_file_option_name='config_file',
+):
+    """ Applies all options set in the config file to `cli_params` """
+    paramname_to_param = {param.name: param for param in command_function.params}
+    path_params = {
+        param.name
+        for param in command_function.params
+        if isinstance(param.type, (click.Path, click.File))
+    }
+
+    config_file_path = Path(cli_params[config_file_option_name])
+    config_file_values = dict()
+    try:
+        with config_file_path.open() as config_file:
+            config_file_values = pytoml.load(config_file)
+    except OSError as ex:
+        # Silently ignore if 'file not found' and the config file path is the default
+        config_file_param = paramname_to_param[config_file_option_name]
+        config_file_default_path = Path(
+            config_file_param.type.expand_default(config_file_param.get_default(ctx), cli_params),
+        )
+        default_config_missing = (
+            ex.errno == errno.ENOENT and
+            config_file_path.resolve() == config_file_default_path.resolve()
+        )
+        if default_config_missing:
+            cli_params['config_file'] = None
+        else:
+            click.secho(f"Error opening config file: {ex}", fg='red')
+            sys.exit(1)
+    except TomlError as ex:
+        click.secho(f'Error loading config file: {ex}', fg='red')
+        sys.exit(1)
+
+    for config_name, config_value in config_file_values.items():
+        config_name_int = config_name.replace('-', '_')
+
+        if config_name_int not in paramname_to_param:
+            click.secho(
+                f"Unknown setting '{config_name}' found in config file - ignoring.",
+                fg='yellow',
+            )
+            continue
+
+        if config_name_int in path_params:
+            # Allow users to use `~` in paths in the config file
+            config_value = os.path.expanduser(config_value)
+
+        if config_name_int == LOG_CONFIG_OPTION_NAME:
+            # Uppercase log level names
+            config_value = {k: v.upper() for k, v in config_value.items()}
+        else:
+            # Pipe config file values through cli converter to ensure correct types
+            # We exclude `log-config` because it already is a dict when loading from toml
+            try:
+                config_value = paramname_to_param[config_name_int].type.convert(
+                    config_value,
+                    paramname_to_param[config_name_int],
+                    ctx,
+                )
+            except click.BadParameter as ex:
+                click.secho(f"Invalid config file setting '{config_name}': {ex}", fg='red')
+                sys.exit(1)
+
+        # Use the config file value if the value from the command line is the default
+        if cli_params[config_name_int] == paramname_to_param[config_name_int].get_default(ctx):
+            cli_params[config_name_int] = config_value
 
 
 ADDRESS_TYPE = AddressType()

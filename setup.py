@@ -5,19 +5,8 @@ import subprocess
 from setuptools import setup, find_packages
 from setuptools import Command
 from setuptools.command.test import test as TestCommand
-from setuptools.command.build_py import build_py
 import distutils.log
 from distutils.spawn import find_executable
-
-
-class BuildPyCommand(build_py):
-
-    def run(self):
-        self.run_command('compile_contracts')
-        # ensure smoketest_config.json is generated
-        from raiden.tests.utils.smoketest import load_or_create_smoketest_config
-        load_or_create_smoketest_config()
-        build_py.run(self)
 
 
 class PyTest(TestCommand):
@@ -32,22 +21,6 @@ class PyTest(TestCommand):
         import pytest
         errno = pytest.main(self.test_args)
         raise SystemExit(errno)
-
-
-class CompileContracts(Command):
-    description = 'compile contracts to json'
-    user_options = []
-
-    def initialize_options(self):
-        pass
-
-    def finalize_options(self):
-        pass
-
-    def run(self):
-        os.environ['STORE_PRECOMPILED'] = 'yes'
-        from raiden.blockchain.abi import CONTRACT_MANAGER
-        CONTRACT_MANAGER.instantiate()
 
 
 class CompileWebUI(Command):
@@ -110,13 +83,8 @@ install_requires_replacements = {
     'git+https://github.com/LefterisJP/pystun@develop#egg=pystun': 'pystun',
     (
         'git+https://github.com/raiden-network/raiden-libs.git'
-        '@f403970bb08bd87e234c27c8977c95746fe451c2'
-        '#egg=raiden-libs'
+        '@9ba6749729b7f7bb940d1483e2d89250820ddca4'
     ): 'raiden-libs',
-    (
-        'git+https://github.com/raiden-network/raiden-contracts.git'
-        '#egg=raiden-contracts'
-    ): 'raiden-contracts',
 }
 
 install_requires = list(set(
@@ -126,7 +94,7 @@ install_requires = list(set(
 
 test_requirements = []
 
-version = '0.3.0'  # Do not edit: this is maintained by bumpversion (see .bumpversion_client.cfg)
+version = '0.4.1'  # Do not edit: this is maintained by bumpversion (see .bumpversion_client.cfg)
 
 setup(
     name='raiden',
@@ -150,9 +118,7 @@ setup(
     ],
     cmdclass={
         'test': PyTest,
-        'compile_contracts': CompileContracts,
         'compile_webui': CompileWebUI,
-        'build_py': BuildPyCommand,
     },
     use_scm_version=True,
     setup_requires=['setuptools_scm'],

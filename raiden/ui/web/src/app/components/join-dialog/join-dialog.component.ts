@@ -1,7 +1,6 @@
 import { Component, OnInit, OnDestroy, Input, Output, EventEmitter } from '@angular/core';
 import { FormControl } from '@angular/forms';
-import { Observable } from 'rxjs/Observable';
-import { Subscription } from 'rxjs/Subscription';
+import { Observable ,  Subscription } from 'rxjs';
 
 import { RaidenService } from '../../services/raiden.service';
 import { SharedService } from '../../services/shared.service';
@@ -47,15 +46,15 @@ export class JoinDialogComponent implements OnInit, OnDestroy {
     public joinTokenNetwork() {
         this.raidenService.connectTokenNetwork(
             this.funds.value,
-            this.tokenAddress)
-            .subscribe((response) =>
-                this.sharedService.msg({
-                    severity: 'success',
-                    summary: 'Joined Token Network',
-                    detail: 'You have successfully Joined the Network' +
-                    ' of Token ' + this.tokenAddress
-                })
-            );
+            this.tokenAddress,
+        ).subscribe((response) =>
+            this.sharedService.msg({
+                severity: 'success',
+                summary: 'Joined Token Network',
+                detail: 'You have successfully Joined the Network' +
+                ' of Token ' + this.tokenAddress
+            })
+        );
         this.visible = false;
     }
 

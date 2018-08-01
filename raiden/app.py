@@ -1,13 +1,15 @@
-import filelock
-import sys
-import structlog
 from binascii import unhexlify
-from eth_utils import to_normalized_address
-from typing import Dict
 
-import gevent
+import structlog
+from eth_utils import to_checksum_address
 
+from raiden.exceptions import InvalidSettleTimeout
 from raiden.network.blockchain_service import BlockChainService
+from raiden.network.proxies import (
+    TokenNetworkRegistry,
+    SecretRegistry,
+    Discovery,
+)
 from raiden.raiden_service import RaidenService
 from raiden.settings import (
     DEFAULT_NAT_INVITATION_TIMEOUT,
@@ -22,21 +24,14 @@ from raiden.settings import (
     DEFAULT_SHUTDOWN_TIMEOUT,
     INITIAL_PORT,
 )
-from raiden.utils import (
-    pex,
-    privatekey_to_address,
-)
-from raiden.network.proxies import (
-    Registry,
-    SecretRegistry,
-    Discovery,
-)
-
-log = structlog.get_logger(__name__)  # pylint: disable=invalid-name
+from raiden.utils import pex
+from raiden.utils.gevent_utils import configure_gevent
+from raiden.utils import typing
 
 
-gevent.get_hub().SYSTEM_ERROR = (BaseException,)
-gevent.get_hub().NOT_ERROR = (gevent.GreenletExit,)
+log = structlog.get_logger(__name__)
+
+configure_gevent()
 
 
 class App:  # pylint: disable=too-few-public-methods
@@ -79,35 +74,46 @@ class App:  # pylint: disable=too-few-public-methods
 
     def __init__(
             self,
-            config: Dict,
+            config: typing.Dict,
             chain: BlockChainService,
-            default_registry: Registry,
+            query_start_block: typing.BlockNumber,
+            default_registry: TokenNetworkRegistry,
             default_secret_registry: SecretRegistry,
             transport,
-            discovery: Discovery=None,
+            discovery: Discovery = None,
     ):
+        raiden = RaidenService(
+            chain=chain,
+            query_start_block=query_start_block,
+            default_registry=default_registry,
+            default_secret_registry=default_secret_registry,
+            private_key_bin=unhexlify(config['privatekey_hex']),
+            transport=transport,
+            config=config,
+            discovery=discovery,
+        )
+
+        # check that the settlement timeout fits the limits of the contract
+        invalid_timeout = (
+            config['settle_timeout'] < default_registry.settlement_timeout_min() or
+            config['settle_timeout'] > default_registry.settlement_timeout_max()
+        )
+        if invalid_timeout:
+            raise InvalidSettleTimeout(
+                (
+                    'Settlement timeout for Registry contract {} must '
+                    'be in range [{}, {}], is {}'
+                ).format(
+                    to_checksum_address(default_registry.address),
+                    default_registry.settlement_timeout_min(),
+                    default_registry.settlement_timeout_max(),
+                    config['settle_timeout'],
+                ),
+            )
+
         self.config = config
         self.discovery = discovery
-
-        try:
-            self.raiden = RaidenService(
-                chain,
-                default_registry,
-                default_secret_registry,
-                unhexlify(config['privatekey_hex']),
-                transport,
-                config,
-                discovery,
-            )
-        except filelock.Timeout:
-            pubkey = to_normalized_address(
-                privatekey_to_address(unhexlify(self.config['privatekey_hex'])),
-            )
-            print(
-                f'FATAL: Another Raiden instance already running for account {pubkey} on '
-                f'network id {chain.network_id}',
-            )
-            sys.exit(1)
+        self.raiden = raiden
         self.start_console = self.config['console']
 
         # raiden.ui.console:Console assumes that a services
@@ -120,12 +126,15 @@ class App:  # pylint: disable=too-few-public-methods
             pex(self.raiden.address),
         )
 
-    def stop(self, leave_channels=False):
-        """
-        Stop the raiden app.
+    def start(self):
+        """ Start the raiden app. """
+        self.raiden.start()
+
+    def stop(self, leave_channels: bool = False):
+        """ Stop the raiden app.
 
         Args:
-            leave_channels (bool): if True, also close and settle all channels before stopping
+            leave_channels: if True, also close and settle all channels before stopping
         """
         if leave_channels:
             self.raiden.close_and_settle()

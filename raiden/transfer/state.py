@@ -2,6 +2,7 @@
 import random
 from binascii import hexlify
 from collections import namedtuple
+from functools import total_ordering
 
 import networkx
 
@@ -59,6 +60,7 @@ def balanceproof_from_envelope(envelope_message):
         envelope_message.message_hash,
         envelope_message.signature,
         envelope_message.sender,
+        envelope_message.chain_id,
     )
 
 
@@ -74,10 +76,12 @@ def message_identifier_from_prng(prng):
     return prng.randint(0, UINT64_MAX)
 
 
-class NodeState(State):
-    """ Umbrella object that stores all the node state.
+class ChainState(State):
+    """ Umbrella object that stores the per blockchain state.
     For each registry smart contract there must be a payment network. Within the
     payment network the existing token networks and channels are registered.
+
+    TODO: Split the node specific attributes to a "NodeState" class
     """
 
     __slots__ = (
@@ -87,35 +91,47 @@ class NodeState(State):
         'identifiers_to_paymentnetworks',
         'nodeaddresses_to_networkstates',
         'payment_mapping',
+        'chain_id',
     )
 
-    def __init__(self, pseudo_random_generator: random.Random, block_number: typing.BlockNumber):
+    def __init__(
+            self,
+            pseudo_random_generator: random.Random,
+            block_number: typing.BlockNumber,
+            chain_id: typing.ChainID,
+    ):
         if not isinstance(block_number, typing.T_BlockNumber):
-            raise ValueError('block_number must be a block_number')
+            raise ValueError('block_number must be of BlockNumber type')
+
+        if not isinstance(chain_id, typing.T_ChainID):
+            raise ValueError('chain_id must be of ChainID type')
 
         self.pseudo_random_generator = pseudo_random_generator
         self.block_number = block_number
+        self.chain_id = chain_id
         self.queueids_to_queues = dict()
         self.identifiers_to_paymentnetworks = dict()
         self.nodeaddresses_to_networkstates = dict()
         self.payment_mapping = PaymentMappingState()
 
     def __repr__(self):
-        return '<NodeState block:{} networks:{} qtd_transfers:{}>'.format(
+        return '<ChainState block:{} networks:{} qty_transfers:{} chain_id:{}>'.format(
             self.block_number,
             lpex(self.identifiers_to_paymentnetworks.keys()),
             len(self.payment_mapping.secrethashes_to_task),
+            self.chain_id,
         )
 
     def __eq__(self, other):
         return (
-            isinstance(other, NodeState) and
+            isinstance(other, ChainState) and
             self.pseudo_random_generator == other.pseudo_random_generator and
             self.block_number == other.block_number and
             self.queueids_to_queues == other.queueids_to_queues and
             self.identifiers_to_paymentnetworks == other.identifiers_to_paymentnetworks and
             self.nodeaddresses_to_networkstates == other.nodeaddresses_to_networkstates and
-            self.payment_mapping == other.payment_mapping
+            self.payment_mapping == other.payment_mapping and
+            self.chain_id == other.chain_id
         )
 
     def __ne__(self, other):
@@ -338,6 +354,7 @@ class BalanceProofUnsignedState(State):
         'locksroot',
         'token_network_identifier',
         'channel_address',
+        'chain_id',
     )
 
     def __init__(
@@ -347,7 +364,8 @@ class BalanceProofUnsignedState(State):
             locked_amount: typing.TokenAmount,
             locksroot: typing.Locksroot,
             token_network_identifier: typing.Address,
-            channel_address: typing.Address,
+            channel_address: typing.Address,  # FIXME: is this used anywhere
+            chain_id: typing.ChainID,
     ):
         if not isinstance(nonce, int):
             raise ValueError('nonce must be int')
@@ -364,6 +382,9 @@ class BalanceProofUnsignedState(State):
         if not isinstance(channel_address, typing.T_Address):
             raise ValueError('channel_address must be an address instance')
 
+        if not isinstance(chain_id, typing.T_ChainID):
+            raise ValueError('chain_id must be a ChainID instance')
+
         if nonce <= 0:
             raise ValueError('nonce cannot be zero or negative')
 
@@ -379,8 +400,8 @@ class BalanceProofUnsignedState(State):
         if len(locksroot) != 32:
             raise ValueError('locksroot must have length 32')
 
-        if len(channel_address) != 20:
-            raise ValueError('channel is an invalid address')
+        if len(channel_address) != 32:
+            raise ValueError('channel id is invalid')
 
         self.nonce = nonce
         self.transferred_amount = transferred_amount
@@ -388,12 +409,13 @@ class BalanceProofUnsignedState(State):
         self.locksroot = locksroot
         self.token_network_identifier = token_network_identifier
         self.channel_address = channel_address
+        self.chain_id = chain_id
 
     def __repr__(self):
         return (
             '<'
             'BalanceProofUnsignedState nonce:{} transferred_amount:{} '
-            'locked_amount:{} locksroot:{} token_network:{} channel_address:{}'
+            'locked_amount:{} locksroot:{} token_network:{} channel_address:{} chain_id: {}'
             '>'
         ).format(
             self.nonce,
@@ -402,6 +424,7 @@ class BalanceProofUnsignedState(State):
             pex(self.locksroot),
             pex(self.token_network_identifier),
             pex(self.channel_address),
+            self.chain_id,
         )
 
     def __eq__(self, other):
@@ -412,7 +435,8 @@ class BalanceProofUnsignedState(State):
             self.locked_amount == other.locked_amount and
             self.locksroot == other.locksroot and
             self.token_network_identifier == other.token_network_identifier and
-            self.channel_address == other.channel_address
+            self.channel_address == other.channel_address and
+            self.chain_id == other.chain_id
         )
 
     def __ne__(self, other):
@@ -442,6 +466,7 @@ class BalanceProofSignedState(State):
         'message_hash',
         'signature',
         'sender',
+        'chain_id',
     )
 
     def __init__(
@@ -455,6 +480,7 @@ class BalanceProofSignedState(State):
             message_hash: typing.Keccak256,
             signature: typing.Signature,
             sender: typing.Address,
+            chain_id: typing.ChainID,
     ):
         if not isinstance(nonce, int):
             raise ValueError('nonce must be int')
@@ -483,6 +509,9 @@ class BalanceProofSignedState(State):
         if not isinstance(sender, typing.T_Address):
             raise ValueError('sender must be an address instance')
 
+        if not isinstance(chain_id, typing.T_ChainID):
+            raise ValueError('chain_id must be a ChainID instance')
+
         if nonce <= 0:
             raise ValueError('nonce cannot be zero or negative')
 
@@ -498,8 +527,8 @@ class BalanceProofSignedState(State):
         if len(locksroot) != 32:
             raise ValueError('locksroot must have length 32')
 
-        if len(channel_address) != 20:
-            raise ValueError('channel is an invalid address')
+        if len(channel_address) != 32:
+            raise ValueError('channel id is invalid')
 
         if len(message_hash) != 32:
             raise ValueError('message_hash is an invalid hash')
@@ -516,13 +545,14 @@ class BalanceProofSignedState(State):
         self.message_hash = message_hash
         self.signature = signature
         self.sender = sender
+        self.chain_id = chain_id
 
     def __repr__(self):
         return (
             '<'
             'BalanceProofSignedState nonce:{} transferred_amount:{} '
             'locked_amount:{} locksroot:{} token_network:{} channel_address:{} '
-            'message_hash:{} signature:{} sender:{}'
+            'message_hash:{} signature:{} sender:{} chain_id:{}'
             '>'
         ).format(
             self.nonce,
@@ -534,6 +564,7 @@ class BalanceProofSignedState(State):
             pex(self.message_hash),
             pex(self.signature),
             pex(self.sender),
+            self.chain_id,
         )
 
     def __eq__(self, other):
@@ -547,7 +578,8 @@ class BalanceProofSignedState(State):
             self.channel_address == other.channel_address and
             self.message_hash == other.message_hash and
             self.signature == other.signature and
-            self.sender == other.sender
+            self.sender == other.sender and
+            self.chain_id == other.chain_id
         )
 
     def __ne__(self, other):
@@ -832,6 +864,7 @@ class NettingChannelState(State):
 
     __slots__ = (
         'identifier',
+        'chain_id',
         'our_state',
         'partner_state',
         'token_address',
@@ -842,11 +875,13 @@ class NettingChannelState(State):
         'open_transaction',
         'close_transaction',
         'settle_transaction',
+        'our_unlock_transaction',
     )
 
     def __init__(
             self,
             identifier,
+            chain_id: typing.ChainID,
             token_address: typing.Address,
             token_network_identifier: typing.Address,
             reveal_timeout: typing.BlockNumber,
@@ -902,6 +937,8 @@ class NettingChannelState(State):
         self.open_transaction = open_transaction
         self.close_transaction = close_transaction
         self.settle_transaction = settle_transaction
+        self.our_unlock_transaction = None
+        self.chain_id = chain_id
 
     def __repr__(self):
         return '<NettingChannelState id:{} opened:{} closed:{} settled:{}>'.format(
@@ -924,13 +961,15 @@ class NettingChannelState(State):
             self.deposit_transaction_queue == other.deposit_transaction_queue and
             self.open_transaction == other.open_transaction and
             self.close_transaction == other.close_transaction and
-            self.settle_transaction == other.settle_transaction
+            self.settle_transaction == other.settle_transaction and
+            self.chain_id == other.chain_id
         )
 
     def __ne__(self, other):
         return not self.__eq__(other)
 
 
+@total_ordering
 class TransactionChannelNewBalance(State):
     def __init__(
             self,
@@ -959,15 +998,22 @@ class TransactionChannelNewBalance(State):
         )
 
     def __eq__(self, other):
+        if not isinstance(other, TransactionChannelNewBalance):
+            return NotImplemented
         return (
-            isinstance(other, TransactionChannelNewBalance) and
             self.participant_address == other.participant_address and
             self.contract_balance == other.contract_balance and
             self.deposit_block_number == other.deposit_block_number
         )
 
-    def __ne__(self, other):
-        return not self.__eq__(other)
+    def __lt__(self, other):
+        if not isinstance(other, TransactionChannelNewBalance):
+            return NotImplemented
+        return (
+            self.participant_address < other.participant_address and
+            self.contract_balance < other.contract_balance and
+            self.deposit_block_number < other.deposit_block_number
+        )
 
 
 class MetricsState(State):

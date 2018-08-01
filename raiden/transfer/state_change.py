@@ -226,26 +226,35 @@ class ContractReceiveChannelClosed(StateChange):
         return not self.__eq__(other)
 
 
-class ActionInitNode(StateChange):
+class ActionInitChain(StateChange):
     def __init__(
             self,
             pseudo_random_generator,
             block_number: typing.BlockNumber,
+            chain_id: typing.ChainID,
     ):
         if not isinstance(block_number, int):
             raise ValueError('block_number must be int')
 
+        if not isinstance(chain_id, int):
+            raise ValueError('chain_id must be int')
+
         self.pseudo_random_generator = pseudo_random_generator
         self.block_number = block_number
+        self.chain_id = chain_id
 
     def __repr__(self):
-        return '<ActionInitNode block_number:{}>'.format(self.block_number)
+        return '<ActionInitChain block_number:{} chain_id:{}>'.format(
+            self.block_number,
+            self.chain_id,
+        )
 
     def __eq__(self, other):
         return (
-            isinstance(other, ActionInitNode) and
+            isinstance(other, ActionInitChain) and
             self.pseudo_random_generator == other.pseudo_random_generator and
-            self.block_number == other.block_number
+            self.block_number == other.block_number and
+            self.chain_id == other.chain_id
         )
 
     def __ne__(self, other):
@@ -497,61 +506,6 @@ class ContractReceiveSecretReveal(StateChange):
         return not self.__eq__(other)
 
 
-class ContractReceiveChannelUnlock(StateChange):
-    """ A lock was claimed via the blockchain.
-    Used when a hash time lock was unlocked and a log ChannelSecretRevealed is
-    emitted by the netting channel.
-    Note:
-        For this state change the contract caller is not important but only the
-        receiving address. `receiver` is the address to which the lock's token
-        was transferred, this may be either of the channel participants.
-        If the channel was used for a mediated transfer that was refunded, this
-        event must be used twice, once for each receiver.
-    """
-
-    def __init__(
-            self,
-            payment_network_identifier: typing.PaymentNetworkID,
-            token_address: typing.TokenAddress,
-            channel_identifier: typing.ChannelID,
-            secret: typing.Secret,
-            receiver: typing.Address,
-    ):
-
-        if not isinstance(receiver, typing.T_Address):
-            raise ValueError('receiver must be of type address')
-
-        secrethash: typing.SecretHash = typing.SecretHash(sha3(secret))
-
-        self.payment_network_identifier = payment_network_identifier
-        self.token_address = token_address
-        self.channel_identifier = channel_identifier
-        self.secret = secret
-        self.secrethash = secrethash
-        self.receiver = receiver
-
-    def __repr__(self):
-        return '<ContractReceiveChannelUnlock channel:{} receive:{} secrethash:{}>'.format(
-            pex(self.channel_identifier),
-            pex(self.receiver),
-            pex(self.secrethash),
-        )
-
-    def __eq__(self, other):
-        return (
-            isinstance(other, ContractReceiveChannelUnlock) and
-            self.payment_network_identifier == other.payment_network_identifier and
-            self.token_address == other.token_address and
-            self.channel_identifier == other.channel_identifier and
-            self.secret == other.secret and
-            self.secrethash == other.secrethash and
-            self.receiver == other.receiver
-        )
-
-    def __ne__(self, other):
-        return not self.__eq__(other)
-
-
 class ContractReceiveChannelBatchUnlock(StateChange):
     """ All the locks were claimed via the blockchain.
 
@@ -565,54 +519,53 @@ class ContractReceiveChannelBatchUnlock(StateChange):
 
     def __init__(
             self,
-            payment_network_identifier: typing.PaymentNetworkID,
-            token_address: typing.TokenAddress,
-            channel_identifier: typing.ChannelID,
-            merkle_tree_leaves: typing.MerkleTreeLeaves,
+            token_network_identifier: typing.TokenNetworkIdentifier,
             participant: typing.Address,
+            partner: typing.Address,
+            locksroot: typing.Locksroot,
             unlocked_amount: typing.TokenAmount,
             returned_tokens: typing.TokenAmount,
     ):
 
-        if not isinstance(payment_network_identifier, typing.T_PaymentNetworkID):
-            raise ValueError('payment_network_identifier must be of type PaymentNetworkID')
+        if not isinstance(token_network_identifier, typing.T_TokenNetworkIdentifier):
+            raise ValueError('token_network_identifier must be of type TokenNtetworkIdentifier')
 
         if not isinstance(participant, typing.T_Address):
             raise ValueError('participant must be of type address')
 
-        self.payment_network_identifier = payment_network_identifier
-        self.token_address = token_address
-        self.channel_identifier = channel_identifier
-        self.merkle_tree_leaves = merkle_tree_leaves
+        if not isinstance(partner, typing.T_Address):
+            raise ValueError('partner must be of type address')
+
+        self.token_network_identifier = token_network_identifier
         self.participant = participant
+        self.partner = partner
+        self.locksroot = locksroot
         self.unlocked_amount = unlocked_amount
         self.returned_tokens = returned_tokens
 
-
-class ContractReceiveNewRoute(StateChange):
-    """ New channel was created and this node is NOT a participant. """
-
-    def __init__(self, participant1: typing.Address, participant2: typing.Address):
-        if not isinstance(participant1, typing.T_Address):
-            raise ValueError('participant1 must be of type address')
-
-        if not isinstance(participant2, typing.T_Address):
-            raise ValueError('participant2 must be of type address')
-
-        self.participant1 = participant1
-        self.participant2 = participant2
-
     def __repr__(self):
-        return '<ContractReceiveNewRoute node1:{} node2:{}>'.format(
-            pex(self.participant1),
-            pex(self.participant2),
+        return (
+            '<ContractReceiveChannelBatchUnlock'
+            'token_network:{} participant:{} partner:{} locksroot:{} unlocked:{} returned:{}'
+            '>'
+        ).format(
+            self.token_network_identifier,
+            self.participant,
+            self.partner,
+            self.locksroot,
+            self.unlocked_amount,
+            self.returned_tokens,
         )
 
     def __eq__(self, other):
         return (
-            isinstance(other, ContractReceiveNewRoute) and
-            self.participant1 == other.participant1 and
-            self.participant2 == other.participant2
+            isinstance(other, ContractReceiveChannelBatchUnlock) and
+            self.token_network_identifier == other.token_network_identifier and
+            self.participant == other.participant and
+            self.partner == other.partner and
+            self.locksroot == other.locksroot and
+            self.unlocked_amount == other.unlocked_amount and
+            self.returned_tokens == other.returned_tokens
         )
 
     def __ne__(self, other):
@@ -740,7 +693,35 @@ class ReceiveDelivered(StateChange):
     def __init__(self, message_identifier: typing.MessageID):
         self.message_identifier = message_identifier
 
+    def __repr__(self):
+        return '<ReceiveDelivered msgid:{}>'.format(
+            self.message_identifier,
+        )
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, ReceiveDelivered) and
+            self.message_identifier == other.message_identifier
+        )
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
 
 class ReceiveProcessed(StateChange):
     def __init__(self, message_identifier: typing.MessageID):
         self.message_identifier = message_identifier
+
+    def __repr__(self):
+        return '<ReceiveProcessed msgid:{}>'.format(
+            self.message_identifier,
+        )
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, ReceiveProcessed) and
+            self.message_identifier == other.message_identifier
+        )
+
+    def __ne__(self, other):
+        return not self.__eq__(other)

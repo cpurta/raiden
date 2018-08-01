@@ -2,13 +2,15 @@
 import string
 import random
 
+from eth_utils import keccak
+
 from raiden.constants import (
     UINT64_MAX,
     UINT256_MAX,
 )
 from raiden.utils import sha3
 from raiden.tests.utils.tests import fixture_all_combinations
-from raiden.tests.utils.factories import make_privkey_address
+from raiden.tests.utils.factories import make_privkey_address, UNIT_CHAIN_ID
 from raiden.transfer.state import EMPTY_MERKLE_ROOT
 from raiden.messages import (
     DirectTransfer,
@@ -19,6 +21,7 @@ from raiden.messages import (
 
 
 PRIVKEY, ADDRESS = make_privkey_address()
+CHANNEL_ID = keccak(b'somechannel')
 INVALID_ADDRESSES = [
     b' ',
     b' ' * 19,
@@ -85,7 +88,7 @@ def make_refund_transfer(
         nonce=1,
         token_network_address=ADDRESS,
         token=ADDRESS,
-        channel=ADDRESS,
+        channel=CHANNEL_ID,
         transferred_amount=0,
         locked_amount=None,
         amount=1,
@@ -94,7 +97,8 @@ def make_refund_transfer(
         target=ADDRESS,
         initiator=ADDRESS,
         fee=0,
-        secrethash=VALID_SECRETHASHES[0]):
+        secrethash=VALID_SECRETHASHES[0],
+):
 
     if message_identifier is None:
         message_identifier = random.randint(0, UINT64_MAX)
@@ -105,20 +109,21 @@ def make_refund_transfer(
         assert locked_amount >= amount
 
     return RefundTransfer(
-        message_identifier,
-        payment_identifier,
-        nonce,
-        token_network_address,
-        token,
-        channel,
-        transferred_amount,
-        locked_amount,
-        recipient,
-        locksroot,
-        make_lock(amount=amount, secrethash=secrethash),
-        target,
-        initiator,
-        fee,
+        chain_id=UNIT_CHAIN_ID,
+        message_identifier=message_identifier,
+        payment_identifier=payment_identifier,
+        nonce=nonce,
+        token_network_address=token_network_address,
+        token=token,
+        channel_identifier=channel,
+        transferred_amount=transferred_amount,
+        locked_amount=locked_amount,
+        recipient=recipient,
+        locksroot=locksroot,
+        lock=make_lock(amount=amount, secrethash=secrethash),
+        target=target,
+        initiator=initiator,
+        fee=fee,
     )
 
 
@@ -126,9 +131,9 @@ def make_mediated_transfer(
         message_identifier=None,
         payment_identifier=0,
         nonce=1,
-        registry_address=ADDRESS,
+        token_network_addresss=ADDRESS,
         token=ADDRESS,
-        channel=ADDRESS,
+        channel=CHANNEL_ID,
         transferred_amount=0,
         locked_amount=None,
         amount=1,
@@ -137,7 +142,8 @@ def make_mediated_transfer(
         recipient=ADDRESS,
         target=ADDRESS,
         initiator=ADDRESS,
-        fee=0):
+        fee=0,
+):
 
     if message_identifier is None:
         message_identifier = random.randint(0, UINT64_MAX)
@@ -156,20 +162,21 @@ def make_mediated_transfer(
         assert locked_amount >= amount
 
     return LockedTransfer(
-        message_identifier,
-        payment_identifier,
-        nonce,
-        registry_address,
-        token,
-        channel,
-        transferred_amount,
-        locked_amount,
-        recipient,
-        locksroot,
-        lock,
-        target,
-        initiator,
-        fee,
+        chain_id=UNIT_CHAIN_ID,
+        message_identifier=message_identifier,
+        payment_identifier=payment_identifier,
+        nonce=nonce,
+        token_network_address=token_network_addresss,
+        token=token,
+        channel_identifier=channel,
+        transferred_amount=transferred_amount,
+        locked_amount=locked_amount,
+        recipient=recipient,
+        locksroot=locksroot,
+        lock=lock,
+        target=target,
+        initiator=initiator,
+        fee=fee,
     )
 
 
@@ -179,7 +186,7 @@ def make_direct_transfer(
         nonce=1,
         registry_address=ADDRESS,
         token=ADDRESS,
-        channel=ADDRESS,
+        channel=CHANNEL_ID,
         transferred_amount=0,
         locked_amount=0,
         recipient=ADDRESS,
@@ -190,6 +197,7 @@ def make_direct_transfer(
         message_identifier = random.randint(0, UINT64_MAX)
 
     return DirectTransfer(
+        UNIT_CHAIN_ID,
         message_identifier,
         payment_identifier,
         nonce,
